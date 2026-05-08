@@ -59,6 +59,23 @@ class SettingsWindow(QWidget):
         model_layout.addWidget(self.model_combo)
         layout.addLayout(model_layout)
         
+        # 4. Audio Ducking
+        duck_layout = QHBoxLayout()
+        duck_label = QLabel("Bajar volumen (Ducking):")
+        self.duck_combo = QComboBox()
+        # percentages: 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100
+        for i in range(0, 101, 10):
+            self.duck_combo.addItem(f"{i}%", userData=i)
+            
+        current_duck = self.config.get("ducking_percentage", 30)
+        index = self.duck_combo.findData(current_duck)
+        if index >= 0:
+            self.duck_combo.setCurrentIndex(index)
+            
+        duck_layout.addWidget(duck_label)
+        duck_layout.addWidget(self.duck_combo)
+        layout.addLayout(duck_layout)
+        
         # Note
         note_label = QLabel("<small><i>*Cambiar el modelo requiere reiniciar la carga de IA.</i></small>")
         layout.addWidget(note_label)
@@ -100,11 +117,13 @@ class SettingsWindow(QWidget):
         mic_id = self.mic_combo.currentData()
         lang_code = self.lang_combo.currentData()
         model = self.model_combo.currentText()
+        duck = self.duck_combo.currentData()
         
         # Update config dictionary
         self.config["microphone"] = mic_id
         self.config["language"] = lang_code
         self.config["model_size"] = model
+        self.config["ducking_percentage"] = duck
         
         # Save to file
         save_config(self.config)

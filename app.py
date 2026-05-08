@@ -13,6 +13,7 @@ from audio_capture import AudioRecorder
 from transcription_engine import Transcriber
 from config_manager import load_config
 from settings_ui import SettingsWindow
+from audio_ducking import AudioDucker
 
 def create_tray_icon_pixmap():
     """Create a simple dynamic icon for the system tray if no .ico file exists."""
@@ -98,12 +99,12 @@ class Orchestrator(QObject):
         self.ui_widget = ui_widget
         self.config = load_config()
         
-        self.ctrl_pressed = False
-        self.cmd_pressed = False
+        self.pressed_keys = set()
         self.is_recording = False
         
         self.recorder = AudioRecorder()
         self.transcriber = None
+        self.audio_ducker = AudioDucker()
 
     def load_model(self):
         model_size = self.config.get("model_size", "base")
@@ -131,17 +132,42 @@ class Orchestrator(QObject):
         time.sleep(0.2)
         pyperclip.copy(original_clipboard)
 
+    def is_exact_hotkey_pressed(self):
+        has_ctrl = False
+        has_cmd = False
+        other_keys = 0
+        
+        for k in self.pressed_keys:
+            if k in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r, keyboard.Key.ctrl):
+                has_ctrl = True
+            elif k in (keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r):
+                has_cmd = True
+            else:
+                other_keys += 1
+                
+        return has_ctrl and has_cmd and other_keys == 0
+
     def check_state(self):
-        if self.ctrl_pressed and self.cmd_pressed:
+        if self.is_exact_hotkey_pressed():
             if not self.is_recording and self.transcriber is not None:
                 self.is_recording = True
                 self.ui_widget.update_ui_signal.emit("recording")
+                
+                # Duck volume
+                duck_perc = self.config.get("ducking_percentage", 30)
+                if duck_perc > 0:
+                    self.audio_ducker.duck(duck_perc)
+                    
                 mic = self.config.get("microphone", "default")
                 self.recorder.start_recording(device_id=mic)
         else:
             if self.is_recording:
                 self.is_recording = False
                 self.ui_widget.update_ui_signal.emit("processing")
+                
+                # Restore volume
+                if self.config.get("ducking_percentage", 30) > 0:
+                    self.audio_ducker.restore()
                 
                 audio_data = self.recorder.stop_recording()
                 
@@ -155,21 +181,12 @@ class Orchestrator(QObject):
                 self.ui_widget.update_ui_signal.emit("ready")
 
     def on_press(self, key):
-        if key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
-            self.ctrl_pressed = True
-        elif key == keyboard.Key.cmd or key == keyboard.Key.cmd_l or key == keyboard.Key.cmd_r:
-            self.cmd_pressed = True
+        self.pressed_keys.add(key)
         self.check_state()
 
     def on_release(self, key):
-        if key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
-            self.ctrl_pressed = False
-        elif key == keyboard.Key.cmd or key == keyboard.Key.cmd_l or key == keyboard.Key.cmd_r:
-            self.cmd_pressed = False
-        elif key == keyboard.Key.esc:
-            print("Exiting application...")
-            # For a proper tray app, esc shouldn't kill it. We remove this.
-            pass
+        if key in self.pressed_keys:
+            self.pressed_keys.remove(key)
         self.check_state()
 
     def start_keep_alive(self):

@@ -5,3 +5,4 @@ PyQt6
 pynput
 pyperclip
 pyautogui
+pycaw
