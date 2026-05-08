@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# User Configs
+config.json
