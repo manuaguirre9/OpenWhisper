@@ -87,10 +87,12 @@ class FloatingWidget(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self.oldPos = None
             # Save position to config
-            from config_manager import save_config
-            self.config["pos_x"] = self.pos().x()
-            self.config["pos_y"] = self.pos().y()
-            save_config(self.config)
+            from config_manager import load_config, save_config
+            current_config = load_config()
+            current_config["pos_x"] = self.pos().x()
+            current_config["pos_y"] = self.pos().y()
+            save_config(current_config)
+            self.config = current_config
 
 # --- Background Orchestrator ---
 class Orchestrator(QObject):
@@ -99,7 +101,6 @@ class Orchestrator(QObject):
         self.ui_widget = ui_widget
         self.config = load_config()
         
-        self.pressed_keys = set()
         self.is_recording = False
         
         self.recorder = AudioRecorder()
@@ -133,19 +134,33 @@ class Orchestrator(QObject):
         pyperclip.copy(original_clipboard)
 
     def is_exact_hotkey_pressed(self):
-        has_ctrl = False
-        has_cmd = False
-        other_keys = 0
+        import ctypes
+        VK_CONTROL = 0x11
+        VK_LWIN = 0x5B
+        VK_RWIN = 0x5C
+        VK_MENU = 0x12  # Alt
+        VK_SHIFT = 0x10 # Shift
         
-        for k in self.pressed_keys:
-            if k in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r, keyboard.Key.ctrl):
-                has_ctrl = True
-            elif k in (keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r):
-                has_cmd = True
-            else:
-                other_keys += 1
+        is_ctrl = bool(ctypes.windll.user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
+        is_win = bool((ctypes.windll.user32.GetAsyncKeyState(VK_LWIN) & 0x8000) or 
+                      (ctypes.windll.user32.GetAsyncKeyState(VK_RWIN) & 0x8000))
+        
+        if not (is_ctrl and is_win):
+            return False
+            
+        is_alt = bool(ctypes.windll.user32.GetAsyncKeyState(VK_MENU) & 0x8000)
+        is_shift = bool(ctypes.windll.user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
+        
+        if is_alt or is_shift:
+            return False
+            
+        # Check A-Z (0x41-0x5A), 0-9 (0x30-0x39) to avoid collisions with other shortcuts
+        keys_to_check = list(range(0x41, 0x5B)) + list(range(0x30, 0x3A))
+        for i in keys_to_check:
+            if ctypes.windll.user32.GetAsyncKeyState(i) & 0x8000:
+                return False
                 
-        return has_ctrl and has_cmd and other_keys == 0
+        return True
 
     def check_state(self):
         if self.is_exact_hotkey_pressed():
@@ -175,19 +190,29 @@ class Orchestrator(QObject):
                 if lang == "auto":
                     lang = None
                     
-                text = self.transcriber.transcribe(audio_data, language=lang)
-                self.inject_text(text)
-                
-                self.ui_widget.update_ui_signal.emit("ready")
+                # Run transcription in a background thread to prevent blocking the listener
+                threading.Thread(target=self._process_audio_and_inject, args=(audio_data, lang), daemon=True).start()
+
+    def _process_audio_and_inject(self, audio_data, lang):
+        try:
+            text = self.transcriber.transcribe(audio_data, language=lang)
+            self.inject_text(text)
+        except Exception as e:
+            print(f"[Orchestrator] Error during transcription/injection: {e}")
+        finally:
+            self.ui_widget.update_ui_signal.emit("ready")
 
     def on_press(self, key):
-        self.pressed_keys.add(key)
-        self.check_state()
+        try:
+            self.check_state()
+        except Exception as e:
+            print(f"Error in on_press: {e}")
 
     def on_release(self, key):
-        if key in self.pressed_keys:
-            self.pressed_keys.remove(key)
-        self.check_state()
+        try:
+            self.check_state()
+        except Exception as e:
+            print(f"Error in on_release: {e}")
 
     def start_keep_alive(self):
         """Periodically hits the model with silence so Windows doesn't page it out of RAM."""

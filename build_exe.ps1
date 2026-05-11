@@ -3,7 +3,7 @@
 # --onedir: Crea una carpeta con los archivos en lugar de un unico .exe lento
 # --collect-data y --collect-all: Fuerza a que se incluyan las librerias pesadas de IA
 
-pyinstaller --noconsole --onedir `
+pyinstaller --noconsole --onedir --noconfirm `
     --name OpenWhisper `
     --collect-data faster_whisper `
     --collect-all ctranslate2 `

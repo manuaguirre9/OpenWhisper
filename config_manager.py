@@ -1,7 +1,14 @@
 import json
 import os
 
-CONFIG_FILE = "config.json"
+app_data = os.environ.get('APPDATA')
+if app_data:
+    CONFIG_DIR = os.path.join(app_data, "OpenWhisper")
+else:
+    CONFIG_DIR = os.path.join(os.path.expanduser('~'), ".openwhisper")
+
+os.makedirs(CONFIG_DIR, exist_ok=True)
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
 DEFAULT_CONFIG = {
     "language": "es",
