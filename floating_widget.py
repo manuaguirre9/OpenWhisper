@@ -28,6 +28,9 @@ WF_ACCENT_PROCESSING = QColor(180, 160, 255)  # soft lavender
 
 class FloatingWidget(QWidget):
     update_ui_signal = pyqtSignal(str)
+    # Reports model-download progress as an integer percentage 0..100.
+    # Only meaningful in the 'loading' state.
+    update_loading_progress_signal = pyqtSignal(int)
 
     NUM_BARS = 26
     # Widget and pill share the exact same bounds — no transparent gap
@@ -68,7 +71,11 @@ class FloatingWidget(QWidget):
         self._bar_levels = np.zeros(self.NUM_BARS, dtype=np.float32)
         self._anim_phase = 0.0
 
+        # Loading % shown in the loading state (None = generic "Cargando IA…").
+        self._loading_percent = None
+
         self.update_ui_signal.connect(self.handle_state_change)
+        self.update_loading_progress_signal.connect(self._handle_loading_progress)
         self.oldPos = None
 
         self._timer = QTimer(self)
@@ -110,7 +117,21 @@ class FloatingWidget(QWidget):
         self._timer.start(interval)
         if state == "recording":
             self._bar_levels[:] = 0.0
+        # Drop the cached loading % when we leave the loading state, so a
+        # later reload starts from "Cargando IA…" instead of stale 100%.
+        if state != "loading":
+            self._loading_percent = None
         self.update()
+
+    def _handle_loading_progress(self, percent):
+        # Clamp and ignore obviously invalid values.
+        try:
+            p = int(percent)
+        except (TypeError, ValueError):
+            return
+        self._loading_percent = max(0, min(100, p))
+        if self.state == "loading":
+            self.update()
 
     def _tick(self):
         self._anim_phase = (self._anim_phase + 0.22) % (2.0 * math.pi)
@@ -176,9 +197,35 @@ class FloatingWidget(QWidget):
         painter.end()
 
     def _paint_loading(self, painter, rect):
-        cx = rect.center().x() - 10
         cy = rect.center().y()
-        self._draw_pulsing_dots(painter, cx, cy, color=WF_ON_SURFACE_MUTED, spacing=10)
+        if self._loading_percent is None:
+            # Generic loading — just the pulsing dots, centered.
+            cx = rect.center().x() - 10
+            self._draw_pulsing_dots(painter, cx, cy, color=WF_ON_SURFACE_MUTED, spacing=10)
+            return
+
+        # Loading with progress: small dots on the left + label "Cargando IA · 45%"
+        # centered as a unit so it stays balanced inside the pill.
+        text = f"Cargando IA · {self._loading_percent}%"
+        dot_count = 3
+        dot_spacing = 8
+        dot_block_w = (dot_count - 1) * dot_spacing + 6  # 6 = generous dot size
+        gap = 10
+
+        font = QFont("Segoe UI", 9, QFont.Weight.Normal)
+        painter.setFont(font)
+        text_w = painter.fontMetrics().horizontalAdvance(text)
+
+        total_w = dot_block_w + gap + text_w
+        start_x = rect.left() + (rect.width() - total_w) / 2.0
+
+        dot_cx = start_x + 3
+        self._draw_pulsing_dots(painter, dot_cx, cy,
+                                color=WF_ON_SURFACE_MUTED, spacing=dot_spacing)
+
+        self._draw_text(painter, rect, text,
+                        left=start_x + dot_block_w + gap,
+                        color=WF_ON_SURFACE_MUTED, size=9)
 
     def _paint_ready(self, painter, rect):
         # Center the [icon + spacing + text] block as a single visual unit

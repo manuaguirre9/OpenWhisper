@@ -15,6 +15,7 @@ from config_manager import load_config
 from settings_ui import SettingsWindow
 from audio_ducking import AudioDucker
 from floating_widget import FloatingWidget
+from batch_window import BatchTranscriptionWindow
 
 def create_tray_icon_pixmap():
     """Create a simple dynamic icon for the system tray if no .ico file exists."""
@@ -43,10 +44,18 @@ class Orchestrator(QObject):
         model_size = self.config.get("model_size", "base")
         cpu_threads = self.config.get("cpu_threads", 0)
         vocabulary = self.config.get("custom_vocabulary", "")
+
+        def on_download_progress(done_mb, total_mb):
+            if total_mb <= 0:
+                return
+            pct = int(min(100, max(0, (done_mb / total_mb) * 100)))
+            self.ui_widget.update_loading_progress_signal.emit(pct)
+
         self.transcriber = Transcriber(
             model_size=model_size,
             cpu_threads=cpu_threads,
             vocabulary=vocabulary,
+            progress_cb=on_download_progress,
         )
         self.ui_widget.update_ui_signal.emit("ready")
 
@@ -213,14 +222,27 @@ if __name__ == '__main__':
     # Settings Window
     settings_win = SettingsWindow()
     settings_win.settings_saved.connect(orchestrator.apply_new_config)
-    
+
+    # Batch transcription window — shares the orchestrator's Transcriber
+    # via a lambda so it always sees the current instance (after model
+    # reloads triggered by settings changes).
+    batch_win = BatchTranscriptionWindow(
+        dictation_transcriber_provider=lambda: orchestrator.transcriber,
+        config_provider=lambda: orchestrator.config,
+    )
+
     # System Tray
     tray_icon = QSystemTrayIcon(create_tray_icon_pixmap(), app)
     tray_menu = QMenu()
-    
+
+    batch_action = tray_menu.addAction("Transcribir archivo…")
+    batch_action.triggered.connect(lambda: (batch_win.show(), batch_win.raise_(), batch_win.activateWindow()))
+
     config_action = tray_menu.addAction("Configuración")
     config_action.triggered.connect(settings_win.show)
-    
+
+    tray_menu.addSeparator()
+
     quit_action = tray_menu.addAction("Salir")
     quit_action.triggered.connect(app.quit)
     
