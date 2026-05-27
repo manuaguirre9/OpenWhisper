@@ -15,7 +15,9 @@ DEFAULT_CONFIG = {
     "model_size": "base",
     "microphone": "default",
     "hotkey": "ctrl+windows",
-    "ducking_percentage": 30
+    "ducking_percentage": 30,
+    "custom_vocabulary": "",
+    "cpu_threads": 0
 }
 
 def load_config():

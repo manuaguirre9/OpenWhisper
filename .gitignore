@@ -13,3 +13,7 @@ dist/
 
 # User Configs
 config.json
+
+# Tool configs
+.claude/
+

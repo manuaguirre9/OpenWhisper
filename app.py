@@ -5,15 +5,16 @@ import pyperclip
 import pyautogui
 from pynput import keyboard
 
-from PyQt6.QtWidgets import QApplication, QWidget, QLabel, QSystemTrayIcon, QMenu
-from PyQt6.QtCore import Qt, pyqtSignal, QObject
-from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor
+from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
+from PyQt6.QtCore import Qt, QObject
+from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor
 
 from audio_capture import AudioRecorder
 from transcription_engine import Transcriber
 from config_manager import load_config
 from settings_ui import SettingsWindow
 from audio_ducking import AudioDucker
+from floating_widget import FloatingWidget
 
 def create_tray_icon_pixmap():
     """Create a simple dynamic icon for the system tray if no .ico file exists."""
@@ -24,75 +25,6 @@ def create_tray_icon_pixmap():
     painter.drawEllipse(4, 4, 24, 24)
     painter.end()
     return QIcon(pixmap)
-
-# --- UI Component ---
-class FloatingWidget(QWidget):
-    update_ui_signal = pyqtSignal(str)
-
-    def __init__(self):
-        super().__init__()
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Tool
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        # Removed WA_TransparentForMouseEvents to allow dragging
-
-        self.config = load_config()
-        # Restore saved position or default to 100, 100
-        x = self.config.get("pos_x", 100)
-        y = self.config.get("pos_y", 100)
-        self.setGeometry(x, y, 100, 50)
-        
-        self.label = QLabel("🎙️ Loading AI...", self)
-        # Reduced font size
-        self.label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
-        self.update_style("loading")
-        
-        self.update_ui_signal.connect(self.handle_state_change)
-        self.oldPos = None
-
-    def update_style(self, state):
-        # Reduced padding and border-radius to make it smaller
-        if state == "recording":
-            self.label.setText("🔴 Recording...")
-            self.label.setStyleSheet("color: white; background-color: rgba(255, 0, 0, 180); padding: 5px 10px; border-radius: 8px;")
-        elif state == "processing":
-            self.label.setText("⏳ Processing...")
-            self.label.setStyleSheet("color: white; background-color: rgba(0, 0, 255, 180); padding: 5px 10px; border-radius: 8px;")
-        elif state == "ready":
-            self.label.setText("🎙️ Ready")
-            self.label.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 150); padding: 5px 10px; border-radius: 8px;")
-        else: # loading
-            self.label.setStyleSheet("color: white; background-color: rgba(100, 100, 100, 150); padding: 5px 10px; border-radius: 8px;")
-            
-        self.label.adjustSize()
-        self.resize(self.label.size())
-
-    def handle_state_change(self, state):
-        self.update_style(state)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.oldPos = event.globalPosition().toPoint()
-
-    def mouseMoveEvent(self, event):
-        if self.oldPos is not None:
-            delta = event.globalPosition().toPoint() - self.oldPos
-            self.move(self.pos() + delta)
-            self.oldPos = event.globalPosition().toPoint()
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.oldPos = None
-            # Save position to config
-            from config_manager import load_config, save_config
-            current_config = load_config()
-            current_config["pos_x"] = self.pos().x()
-            current_config["pos_y"] = self.pos().y()
-            save_config(current_config)
-            self.config = current_config
 
 # --- Background Orchestrator ---
 class Orchestrator(QObject):
@@ -109,29 +41,58 @@ class Orchestrator(QObject):
 
     def load_model(self):
         model_size = self.config.get("model_size", "base")
-        self.transcriber = Transcriber(model_size=model_size)
+        cpu_threads = self.config.get("cpu_threads", 0)
+        vocabulary = self.config.get("custom_vocabulary", "")
+        self.transcriber = Transcriber(
+            model_size=model_size,
+            cpu_threads=cpu_threads,
+            vocabulary=vocabulary,
+        )
         self.ui_widget.update_ui_signal.emit("ready")
 
     def apply_new_config(self, new_config):
         print("[Orchestrator] Applying new config...")
         old_model = self.config.get("model_size")
+        old_threads = self.config.get("cpu_threads", 0)
         self.config = new_config
-        
-        if new_config.get("model_size") != old_model:
+
+        needs_reload = (
+            new_config.get("model_size") != old_model or
+            new_config.get("cpu_threads", 0) != old_threads
+        )
+
+        if needs_reload:
             self.ui_widget.update_ui_signal.emit("loading")
-            # Reloading model takes time, should ideally be in thread but we do it simply here
             threading.Thread(target=self.load_model, daemon=True).start()
+        elif self.transcriber is not None:
+            # Vocabulary can be updated live without reloading the model
+            self.transcriber.set_vocabulary(new_config.get("custom_vocabulary", ""))
 
     def inject_text(self, text):
         if not text:
             return
         print(f"[Orchestrator] Injecting text: {text}")
-        original_clipboard = pyperclip.paste()
-        pyperclip.copy(text)
-        time.sleep(0.1)
-        pyautogui.hotkey('ctrl', 'v')
-        time.sleep(0.2)
-        pyperclip.copy(original_clipboard)
+
+        # paste() can raise if the clipboard holds a non-text payload
+        # (e.g. an image copied from a browser). In that case we just skip
+        # restoring it instead of crashing the whole injection.
+        original_clipboard = None
+        try:
+            original_clipboard = pyperclip.paste()
+        except Exception as e:
+            print(f"[Orchestrator] Could not read original clipboard: {e}")
+
+        try:
+            pyperclip.copy(text)
+            time.sleep(0.1)
+            pyautogui.hotkey('ctrl', 'v')
+            time.sleep(0.2)
+        finally:
+            if original_clipboard is not None:
+                try:
+                    pyperclip.copy(original_clipboard)
+                except Exception:
+                    pass
 
     def is_exact_hotkey_pressed(self):
         import ctypes
@@ -240,9 +201,12 @@ if __name__ == '__main__':
     # UI
     ui = FloatingWidget()
     ui.show()
-    
+
     # Orchestrator
     orchestrator = Orchestrator(ui)
+    # Wire the recorder into the widget so it can poll live RMS levels
+    # for the waveform visualization while recording.
+    ui.set_recorder(orchestrator.recorder)
     bg_thread = threading.Thread(target=orchestrator.run, daemon=True)
     bg_thread.start()
     
