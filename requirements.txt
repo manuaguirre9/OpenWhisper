@@ -6,3 +6,5 @@ pynput
 pyperclip
 pyautogui
 pycaw
+comtypes
+sherpa-onnx
