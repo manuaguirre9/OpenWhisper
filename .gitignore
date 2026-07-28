@@ -16,4 +16,6 @@ config.json
 
 # Tool configs
 .claude/
+build_log.txt
+
 

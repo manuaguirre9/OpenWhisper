@@ -1,5 +1,3 @@
-import os
-
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QMessageBox, QPlainTextEdit, QSpinBox, QFrame,
@@ -8,6 +6,7 @@ from PyQt6.QtCore import pyqtSignal
 import sounddevice as sd
 
 from config_manager import load_config, save_config
+from system_info import physical_core_count, logical_core_count, resolve_cpu_threads
 from theme import WINDOW_QSS, apply_windows_dark_titlebar
 
 
@@ -70,12 +69,24 @@ class SettingsWindow(QWidget):
         layout.addLayout(self._labeled_row("Bajar volumen al grabar", self.duck_combo))
 
         # --- CPU threads ---
+        # 0 = auto = physical cores. Positive values are capped at the number
+        # of logical cores, so the spinbox itself can't be pushed past what the
+        # CPU actually has (more threads than that only adds contention).
+        self._phys_cores = physical_core_count()
+        self._logi_cores = logical_core_count()
         self.threads_spin = QSpinBox()
-        self.threads_spin.setRange(0, 64)
+        self.threads_spin.setRange(0, self._logi_cores)
         self.threads_spin.setValue(int(self.config.get("cpu_threads", 0)))
-        threads_row = self._labeled_row(f"Hilos de CPU (0 = auto, detectados: {os.cpu_count() or '?'})",
-                                        self.threads_spin)
+        threads_row = self._labeled_row("Hilos de CPU (0 = auto)", self.threads_spin)
         layout.addLayout(threads_row)
+
+        # Live hint showing the concrete thread count that will actually be
+        # used, so "0 = auto" isn't a black box.
+        self.threads_hint = QLabel()
+        self.threads_hint.setObjectName("subtle")
+        self.threads_spin.valueChanged.connect(self._update_threads_hint)
+        self._update_threads_hint()
+        layout.addWidget(self.threads_hint)
 
         # --- Divider ---
         layout.addSpacing(4)
@@ -128,6 +139,16 @@ class SettingsWindow(QWidget):
         apply_windows_dark_titlebar(self)
 
     # ----- helpers -----
+
+    def _update_threads_hint(self):
+        """Reflect the effective thread count for the current spinbox value."""
+        val = self.threads_spin.value()
+        eff = resolve_cpu_threads(val)
+        prefix = "Auto → " if val == 0 else ""
+        self.threads_hint.setText(
+            f"{prefix}usará {eff} hilos  "
+            f"(núcleos físicos: {self._phys_cores}, lógicos: {self._logi_cores})"
+        )
 
     def _labeled_row(self, label_text, widget):
         row = QHBoxLayout()

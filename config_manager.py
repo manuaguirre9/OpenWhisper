@@ -12,12 +12,13 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
 DEFAULT_CONFIG = {
     "language": "es",
-    "model_size": "base",
+    "model_size": "small",
     "microphone": "default",
     "hotkey": "ctrl+windows",
     "ducking_percentage": 30,
     "custom_vocabulary": "",
-    "cpu_threads": 0
+    "cpu_threads": 0,
+    "beam_size": 1
 }
 
 def load_config():

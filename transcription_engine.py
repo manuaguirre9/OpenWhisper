@@ -7,6 +7,8 @@ from typing import Callable, Optional
 from faster_whisper import WhisperModel
 import numpy as np
 
+from system_info import resolve_cpu_threads
+
 # Initial prompts per language. They bias the model towards proper punctuation
 # and capitalization. Using the prompt in the wrong language hurts accuracy,
 # so we pick one per detected/forced language.
@@ -107,6 +109,7 @@ class Transcriber:
         compute_type="int8",
         cpu_threads=0,
         vocabulary="",
+        beam_size=1,
         progress_cb: Optional[Callable[[float, float], None]] = None,
     ):
         """
@@ -115,18 +118,23 @@ class Transcriber:
         - device: 'auto' (chooses CUDA if available, else CPU)
         - compute_type: 'int8' is the safest cross-platform CPU default.
                         'float16' is better for CUDA GPUs.
-        - cpu_threads: 0 = use all logical CPUs. Only applied on CPU device.
+        - cpu_threads: 0 = auto = physical core count (best for CTranslate2,
+                       avoids SMT oversubscription). Positive values are
+                       clamped to the logical core count. See system_info.
         - vocabulary: free-form string of names/jargon/technical terms to bias
                       the model towards (appended to the initial prompt).
+        - beam_size: decoder beam width for dictation. 1 (greedy) is much
+                     faster with minimal quality loss on short/medium clips;
+                     raise to 5 for max accuracy at the cost of latency.
         - progress_cb: optional callable(downloaded_mb, total_mb) used to
                        report download progress on first-time model fetch.
                        Skipped when the model is already cached locally.
         """
-        if cpu_threads == 0:
-            cpu_threads = os.cpu_count() or 4
+        cpu_threads = resolve_cpu_threads(cpu_threads)
 
         self.vocabulary = vocabulary or ""
         self.model_size = model_size
+        self.beam_size = beam_size
 
         # If the model needs downloading and the caller wants progress,
         # pre-fetch with a polling thread so the UI can show a percentage.
@@ -147,7 +155,7 @@ class Transcriber:
                 device=device,
                 compute_type=compute_type,
                 cpu_threads=cpu_threads,
-                num_workers=2,
+                num_workers=1,
             )
             print("[Transcriber] Model loaded successfully.")
         except Exception as e:
@@ -158,7 +166,7 @@ class Transcriber:
                 device=device,
                 compute_type="float32",
                 cpu_threads=cpu_threads,
-                num_workers=2,
+                num_workers=1,
             )
 
     def set_vocabulary(self, vocabulary: str):
@@ -189,7 +197,7 @@ class Transcriber:
         # context from prior sentences, which matters for short dictation.
         segments, info = self.model.transcribe(
             audio_array,
-            beam_size=5,
+            beam_size=self.beam_size,
             language=language,
             initial_prompt=prompt,
             vad_filter=True,

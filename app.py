@@ -41,9 +41,10 @@ class Orchestrator(QObject):
         self.audio_ducker = AudioDucker()
 
     def load_model(self):
-        model_size = self.config.get("model_size", "base")
+        model_size = self.config.get("model_size", "small")
         cpu_threads = self.config.get("cpu_threads", 0)
         vocabulary = self.config.get("custom_vocabulary", "")
+        beam_size = self.config.get("beam_size", 1)
 
         def on_download_progress(done_mb, total_mb):
             if total_mb <= 0:
@@ -55,6 +56,7 @@ class Orchestrator(QObject):
             model_size=model_size,
             cpu_threads=cpu_threads,
             vocabulary=vocabulary,
+            beam_size=beam_size,
             progress_cb=on_download_progress,
         )
         self.ui_widget.update_ui_signal.emit("ready")
@@ -74,8 +76,9 @@ class Orchestrator(QObject):
             self.ui_widget.update_ui_signal.emit("loading")
             threading.Thread(target=self.load_model, daemon=True).start()
         elif self.transcriber is not None:
-            # Vocabulary can be updated live without reloading the model
+            # Vocabulary and beam_size can be updated live without reloading.
             self.transcriber.set_vocabulary(new_config.get("custom_vocabulary", ""))
+            self.transcriber.beam_size = new_config.get("beam_size", 1)
 
     def inject_text(self, text):
         if not text:
