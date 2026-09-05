@@ -19,3 +19,8 @@ config.json
 build_log.txt
 
 
+
+# Test / benchmark
+.pytest_cache/
+benchmark/*.json
+!benchmark/resources/*.json
