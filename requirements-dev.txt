@@ -1,4 +1,17 @@
-# Dependencias de desarrollo/test (instala también las de runtime).
--r requirements.txt
+# Dependencias para el BANCO DE PRUEBAS y los tests.
+#
+# A propósito NO incluye requirements.txt: la app de escritorio depende de
+# pycaw/comtypes (solo Windows) y PyQt6, y el banco no necesita nada de eso.
+# Así corre igual en la Pi, en un contenedor o en CI.
+#
+#   pip install -r requirements-dev.txt
+#   pytest
+#   python benchmark/bench_dictation.py
 
-pytest==8.3.4
+faster-whisper
+numpy
+pytest
+
+# Solo para benchmark/record_clip.py (grabar clips propios desde el micrófono).
+# Si vas a correr el banco sobre clips ya grabados, no hace falta.
+sounddevice
