@@ -1,4 +1,5 @@
 faster-whisper
+psutil
 sounddevice
 numpy
 PyQt6
