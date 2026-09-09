@@ -182,12 +182,20 @@ class SettingsWindow(QWidget):
             self.mic_combo.addItem("Error detectando micrófonos", userData="default")
 
     def save_settings(self):
-        self.config["microphone"] = self.mic_combo.currentData()
-        self.config["language"] = self.lang_combo.currentData()
-        self.config["model_size"] = self.model_combo.currentText()
-        self.config["ducking_percentage"] = self.duck_combo.currentData()
-        self.config["cpu_threads"] = self.threads_spin.value()
-        self.config["custom_vocabulary"] = self.vocab_edit.toPlainText().strip()
+        # Re-read from disk instead of writing back the snapshot taken in
+        # __init__ (which runs once, at app start). The floating overlay
+        # writes pos_x/pos_y on every drag-release, so saving the stale copy
+        # would silently revert the widget's position — and on a first run,
+        # where those keys don't exist yet, drop it entirely. Only the keys
+        # this window actually owns are overwritten.
+        config = load_config()
+        config["microphone"] = self.mic_combo.currentData()
+        config["language"] = self.lang_combo.currentData()
+        config["model_size"] = self.model_combo.currentText()
+        config["ducking_percentage"] = self.duck_combo.currentData()
+        config["cpu_threads"] = self.threads_spin.value()
+        config["custom_vocabulary"] = self.vocab_edit.toPlainText().strip()
+        self.config = config
 
         save_config(self.config)
         self.settings_saved.emit(self.config)
