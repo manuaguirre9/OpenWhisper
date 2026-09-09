@@ -30,9 +30,17 @@ For a reproducible measurement over a fixed audio file (no mic, no human,
 WER included), use `python benchmark/bench_dictation.py` instead.
 
 Run it yourself (it needs the mic + your keyboard):
-    ! python streaming_prototype.py            # uses model from config.json
-    ! python streaming_prototype.py small      # force a model size
+    ! python streaming_prototype.py                 # small, physical cores
+    ! python streaming_prototype.py base            # force a model size
+    ! python streaming_prototype.py small 3         # ...and cpu_threads
+    ! python streaming_prototype.py small --trim 8  # shorter rolling buffer
+
+--trim is the knob that matters on the Pi: every pass re-transcribes the
+WHOLE buffer, so a 20s buffer costs 20s of audio per pass. Trimming to 8s
+bounds that. It is a flag and not a new default because Windows optimizes
+for dictation quality and Nito for latency — different profiles, same code.
 """
+import argparse
 import sys
 import time
 import queue
@@ -48,6 +56,7 @@ from system_info import physical_core_count
 from streaming_core import (
     SAMPLE_RATE,
     MIN_CHUNK_S,
+    TRIM_BUFFER_S,
     FULL_BEAM,
     OnlineASR,
     transcribe_one_shot,
@@ -57,13 +66,19 @@ PTT_KEY = keyboard.Key.f8
 
 
 class Session:
-    def __init__(self, model, language, device):
+    def __init__(self, model, language, device, trim_buffer_s=TRIM_BUFFER_S):
         self.model = model
         self.language = language
         self.device = device
+        self.trim_buffer_s = trim_buffer_s
         self.audio_q = queue.Queue()
         self.recording = False
         self.stream = None
+        # True from start() until _finalize() returns. start() refuses to
+        # re-enter while set: the report prints after the release, and an
+        # impatient second F8 would otherwise swap self.online out from
+        # under the thread still finalizing the previous take.
+        self.busy = False
 
     # ---- audio ----
     def _callback(self, indata, frames, t, status):
@@ -73,14 +88,28 @@ class Session:
             self.audio_q.put(indata.copy().flatten())
 
     def start(self):
+        if self.busy:
+            return
+        self.busy = True
         self.recording = True
         self.online = OnlineASR(
             self.model, self.language,
+            trim_buffer_s=self.trim_buffer_s,
             on_error=lambda e: print(f"\n[pass falló] {e}", file=sys.stderr),
         )
         self.full_chunks = []
         self.pass_times = []
         self.commit_lat = []
+
+        # Audio drenado de la cola pero todavía no entregado a OnlineASR.
+        # El hilo productor escribe acá; el de pasadas lo vacía de un saque
+        # justo antes de transcribir. OnlineASR sigue viéndose a sí mismo
+        # como single-threaded, que es por qué streaming_core no se toca.
+        self._pending = []
+        self._pending_samples = 0
+        self._pending_lock = threading.Lock()
+        self._drained = threading.Event()
+
         with self.audio_q.mutex:
             self.audio_q.queue.clear()
         self.t_start = time.time()
@@ -90,7 +119,8 @@ class Session:
         )
         self.stream.start()
         print("\n🔴 grabando… (soltá F8 para finalizar)")
-        threading.Thread(target=self._loop, daemon=True).start()
+        threading.Thread(target=self._drain_loop, daemon=True).start()
+        threading.Thread(target=self._pass_loop, daemon=True).start()
 
     def stop(self):
         if not self.recording:
@@ -104,22 +134,59 @@ class Session:
             finally:
                 self.stream = None
 
-    # ---- streaming loop ----
-    def _loop(self):
-        since_last = 0
+    # ---- streaming loops ----
+    # Antes esto era un solo hilo: sacaba un chunk de la cola y después se
+    # bloqueaba adentro de _run_pass() por toda la pasada. Durante ese rato
+    # nadie drenaba audio_q. La cola no tiene tope así que no se perdía
+    # audio, pero la cadencia de pasadas quedaba irregular — y en la Pi,
+    # donde una pasada puede pasarse de MIN_CHUNK_S, el atraso se acumula en
+    # vez de corregirse. Ahora un hilo sólo drena y otro sólo transcribe.
+
+    def _drain_loop(self):
+        """Productor: saca audio de la cola. No transcribe nunca."""
         while True:
             try:
                 chunk = self.audio_q.get(timeout=0.1)
-                self.online.insert_audio(chunk)
-                self.full_chunks.append(chunk)
-                since_last += len(chunk)
             except queue.Empty:
-                pass
+                if not self.recording:
+                    break
+                continue
+            with self._pending_lock:
+                self._pending.append(chunk)
+                self._pending_samples += len(chunk)
+            self.full_chunks.append(chunk)
+        self._drained.set()
+
+    def _take_pending(self):
+        """Vacía el buffer de entrega y devuelve (chunks, cantidad_de_samples)."""
+        with self._pending_lock:
+            chunks, self._pending = self._pending, []
+            n, self._pending_samples = self._pending_samples, 0
+        return chunks, n
+
+    def _pass_loop(self):
+        """Consumidor: corre las pasadas de Whisper. No toca la cola."""
+        since_last = 0
+        while True:
+            chunks, n = self._take_pending()
+            for c in chunks:
+                self.online.insert_audio(c)
+            since_last += n
+
             if since_last >= MIN_CHUNK_S * SAMPLE_RATE:
                 since_last = 0
                 self._run_pass()
-            if not self.recording and self.audio_q.empty():
+                continue
+
+            if self._drained.is_set():
+                # El productor ya salió, así que no puede llegar nada nuevo.
+                # Absorbé lo que haya entrado entre el take de arriba y esto.
+                chunks, _ = self._take_pending()
+                for c in chunks:
+                    self.online.insert_audio(c)
                 break
+
+            time.sleep(0.02)
         self._finalize()
 
     def _run_pass(self):
@@ -162,6 +229,7 @@ class Session:
         kept_up = "SÍ" if max_pass <= MIN_CHUNK_S else "NO (se atrasa)"
 
         print("\n" + "=" * 68)
+        print(f"  config           : trim {self.trim_buffer_s:.0f}s")
         print(f"  duración grabada : {rec_dur:5.1f}s")
         print(f"  pasadas streaming: {len(passes)}  (avg {avg_pass:.2f}s · max {max_pass:.2f}s)")
         print(f"  ¿le gana al habla?: {kept_up}   (pasada debe ser < {MIN_CHUNK_S:.0f}s)")
@@ -175,29 +243,46 @@ class Session:
         print(f"  FULL   (beam=5): {full_text}")
         print("=" * 68)
         print("\nMantené F8 para otra prueba, ESC para salir.")
+        self.busy = False
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description="Prototipo de dictado streaming (LocalAgreement-2).",
+    )
+    # Posicionales, para no romper las invocaciones que ya estaban documentadas.
+    p.add_argument("model", nargs="?", default="small",
+                   help="tamaño del modelo Whisper (default: small)")
+    p.add_argument("threads", nargs="?", type=int, default=None,
+                   help="cpu_threads (default: núcleos físicos)")
+    p.add_argument("--trim", type=float, default=TRIM_BUFFER_S, metavar="SEG",
+                   help=f"segundos de buffer antes de recortar "
+                        f"(default: {TRIM_BUFFER_S:.0f}; en la Pi probá 8)")
+    return p.parse_args(argv)
 
 
 def main():
+    args = parse_args()
     cfg = load_config()
     # Default to 'small' (streaming-appropriate), NOT the config's model (medium
-    # is too heavy to keep up here). Override: `python streaming_prototype.py base`.
-    model_size = sys.argv[1] if len(sys.argv) > 1 else "small"
+    # is too heavy to keep up here).
+    model_size = args.model
     language = cfg.get("language", "es")
     if language == "auto":
         language = None
     mic = cfg.get("microphone", "default")
     device = None if mic == "default" else int(mic)
     # Ignore config's cpu_threads (2) for streaming — use all physical cores.
-    # Override with a 2nd CLI arg: `python streaming_prototype.py small 4`.
-    threads = int(sys.argv[2]) if len(sys.argv) > 2 else physical_core_count()
+    threads = args.threads if args.threads is not None else physical_core_count()
 
-    print(f"Cargando modelo '{model_size}' (lang={language}, cpu_threads={threads})…")
+    print(f"Cargando modelo '{model_size}' (lang={language}, cpu_threads={threads}, "
+          f"trim={args.trim:.0f}s)…")
     print("  [streaming usa núcleos FÍSICOS, ignora el cpu_threads=2 del config]")
     model = WhisperModel(model_size, device="auto", compute_type="int8",
                          cpu_threads=threads, num_workers=1)
     print("Modelo listo.")
 
-    session = Session(model, language, device)
+    session = Session(model, language, device, trim_buffer_s=args.trim)
 
     print(f"\n▶  Mantené {PTT_KEY} para hablar, soltá para transcribir. ESC para salir.")
 
