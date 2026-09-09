@@ -20,6 +20,34 @@ bien. Escribilo a mano, una vez, con cuidado.
   Está para que el banco corra apenas clonás el repo, sin grabar nada. **No alcanza
   para decidir nada sobre dictado real**: es inglés, leído, en estudio y limpio.
 
+- **`openslr61-es-ar-corto`** — 4,8s en español rioplatense, una sola frase, de
+  OpenSLR SLR61 es_ar (CC BY-SA 4.0, [openslr.org/61](https://www.openslr.org/61)).
+  Es el clip para la comparación faster-whisper vs whisper.cpp: frase corta,
+  repetible, sin dígitos.
+
+- **`openslr61-es-ar-largo`** — 47,1s, siete frases del mismo hablante del mismo
+  corpus, empalmadas con 0,45s de silencio. **No es una toma continua**, pero da
+  lo que hace falta para comparar streaming contra one-shot: duración, pausas
+  adentro y habla natural con voseo.
+
+Los dos en español se eligieron sin dígitos a propósito (ver la advertencia de más
+abajo) y descartando las frases donde el índice del corpus trae erratas —`comico`
+sin tilde, `no va haber`—, porque `normalize_text()` del banco no saca tildes ni
+inserta palabras y esas erratas contarían como error del modelo.
+
+> **Ojo con `base` en el clip largo.** Con `--models base` el one-shot pierde más de
+> la mitad del texto (48 de 113 palabras) y el banco reporta ~59% de WER. No es el
+> clip: es `initial_prompt` combinado con audio largo y modelo chico. Sin el prompt
+> `base` saca 111/113, y `small` saca 113/113 con o sin prompt. Es un problema real
+> de `transcribe_one_shot()` y de `transcription_engine.py`, que usan el mismo
+> prompt — no un artefacto de la medición.
+
+### Licencias
+
+Los clips no comparten licencia y no son intercambiables si redistribuís esto:
+LibriSpeech es CC BY 4.0, los dos de SLR61 son CC BY-SA **4.0 (ShareAlike)**. La
+atribución de cada uno está en el campo `source` de su `.json`.
+
 ## Agregar clips propios (esto es lo que importa)
 
 ```bash

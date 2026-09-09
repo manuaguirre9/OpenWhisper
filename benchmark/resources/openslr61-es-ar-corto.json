@@ -1,0 +1,6 @@
+{
+  "language": "es",
+  "text": "Tenés que denunciar inmediatamente el accidente para que lo cubra el seguro",
+  "source": "OpenSLR SLR61 es_ar (arm_09334_01379569479, CC BY-SA 4.0, openslr.org/61)",
+  "notes": "Frase única en español rioplatense. Sin dígitos a propósito: Whisper escribe «31» donde se dijo «treinta y uno» y el WER lo cuenta como error."
+}
