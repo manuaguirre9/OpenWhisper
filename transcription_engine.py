@@ -9,6 +9,12 @@ import numpy as np
 
 from system_info import resolve_cpu_threads
 
+# How long a dictation will wait for the model if another thread holds it.
+# Kept short on purpose: if a batch job owns the model the wait would be
+# minutes, and silently swallowing a hotkey press is better than hanging
+# the injection or corrupting a decode.
+_DICTATION_LOCK_TIMEOUT = 0.5
+
 # Initial prompts per language. They bias the model towards proper punctuation
 # and capitalization. Using the prompt in the wrong language hurts accuracy,
 # so we pick one per detected/forced language.
@@ -136,6 +142,16 @@ class Transcriber:
         self.model_size = model_size
         self.beam_size = beam_size
 
+        # One Transcriber can be reached by three threads at once: the
+        # dictation worker (app.Orchestrator._process_audio_and_inject), the
+        # keep-alive timer (app.Orchestrator.start_keep_alive), and the batch
+        # window's QThread — batch_window._resolve_transcriber deliberately
+        # hands back this very instance when the model sizes match. The
+        # underlying CTranslate2 model is built with num_workers=1 and
+        # faster-whisper keeps per-call state on the WhisperModel object, so
+        # concurrent entry corrupts the decode rather than raising. Serialize.
+        self._model_lock = threading.RLock()
+
         # If the model needs downloading and the caller wants progress,
         # pre-fetch with a polling thread so the UI can show a percentage.
         # When already cached, this is a no-op.
@@ -171,7 +187,10 @@ class Transcriber:
 
     def set_vocabulary(self, vocabulary: str):
         """Update custom vocabulary without reloading the model."""
-        self.vocabulary = vocabulary or ""
+        # batch_window._begin_processing_with calls this on the *shared*
+        # dictation instance, so it must not land mid-decode.
+        with self._model_lock:
+            self.vocabulary = vocabulary or ""
 
     def _build_prompt(self, language):
         base = PROMPTS.get(language or "es", PROMPTS["es"])
@@ -188,30 +207,42 @@ class Transcriber:
         if len(audio_array) == 0:
             return ""
 
-        prompt = self._build_prompt(language)
+        if not self._model_lock.acquire(timeout=_DICTATION_LOCK_TIMEOUT):
+            print(
+                "[Transcriber] Model is busy (batch job in progress); "
+                "dropping this dictation instead of corrupting the decode."
+            )
+            return ""
 
-        # VAD filter removes silence chunks, which is faster AND eliminates
-        # the common hallucinations whisper produces on silence
-        # (e.g. "gracias por ver el video").
-        # condition_on_previous_text=False stops the model from dragging
-        # context from prior sentences, which matters for short dictation.
-        segments, info = self.model.transcribe(
-            audio_array,
-            beam_size=self.beam_size,
-            language=language,
-            initial_prompt=prompt,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
-            condition_on_previous_text=False,
-        )
+        try:
+            prompt = self._build_prompt(language)
 
-        print(
-            f"[Transcriber] Detected language '{info.language}' "
-            f"with probability {info.language_probability:.2f}"
-        )
+            # VAD filter removes silence chunks, which is faster AND eliminates
+            # the common hallucinations whisper produces on silence
+            # (e.g. "gracias por ver el video").
+            # condition_on_previous_text=False stops the model from dragging
+            # context from prior sentences, which matters for short dictation.
+            segments, info = self.model.transcribe(
+                audio_array,
+                beam_size=self.beam_size,
+                language=language,
+                initial_prompt=prompt,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
+                condition_on_previous_text=False,
+            )
 
-        text = "".join(segment.text for segment in segments)
-        return text.strip()
+            print(
+                f"[Transcriber] Detected language '{info.language}' "
+                f"with probability {info.language_probability:.2f}"
+            )
+
+            # segments is a lazy generator — it must be drained inside the
+            # lock, not after it.
+            text = "".join(segment.text for segment in segments)
+            return text.strip()
+        finally:
+            self._model_lock.release()
 
     def transcribe_file(self, audio_path, language=None, segment_cb=None, cancel_check=None):
         """
@@ -229,36 +260,41 @@ class Transcriber:
                     for completion.
         cancel_check: optional callable() returning True to abort early.
         """
-        prompt = self._build_prompt(language)
-        segments_gen, info = self.model.transcribe(
-            audio_path,
-            beam_size=5,
-            language=language,
-            initial_prompt=prompt,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
-            condition_on_previous_text=False,
-        )
+        # Held for the whole file: segments_gen is lazy, so the model stays
+        # in use until the loop drains. A batch job can afford to queue behind
+        # an in-flight dictation (sub-second); the reverse is not true, which
+        # is why transcribe() uses a timeout and this does not.
+        with self._model_lock:
+            prompt = self._build_prompt(language)
+            segments_gen, info = self.model.transcribe(
+                audio_path,
+                beam_size=5,
+                language=language,
+                initial_prompt=prompt,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
+                condition_on_previous_text=False,
+            )
 
-        duration = info.duration or 1.0
-        collected = []
-        for segment in segments_gen:
-            if cancel_check is not None and cancel_check():
-                break
-            seg = {
-                "start": float(segment.start),
-                "end": float(segment.end),
-                "text": segment.text,
+            duration = info.duration or 1.0
+            collected = []
+            for segment in segments_gen:
+                if cancel_check is not None and cancel_check():
+                    break
+                seg = {
+                    "start": float(segment.start),
+                    "end": float(segment.end),
+                    "text": segment.text,
+                }
+                collected.append(seg)
+                if segment_cb is not None:
+                    segment_cb(seg, min(1.0, segment.end / duration))
+
+            return collected, {
+                "language": info.language,
+                "language_probability": info.language_probability,
+                "duration": info.duration,
             }
-            collected.append(seg)
-            if segment_cb is not None:
-                segment_cb(seg, min(1.0, segment.end / duration))
-
-        return collected, {
-            "language": info.language,
-            "language_probability": info.language_probability,
-            "duration": info.duration,
-        }
 
     def warmup(self):
         """
@@ -267,6 +303,12 @@ class Transcriber:
         forward pass (with VAD on, silence is filtered out and the model
         is never actually invoked).
         """
+        # Keep-alive fires on a timer thread every 3 minutes and app.py only
+        # guards it with `not is_recording` — which is already False while a
+        # dictation decode runs in its own thread. Never block for it: if the
+        # model is in use it is hot by definition, which is the whole point.
+        if not self._model_lock.acquire(blocking=False):
+            return
         try:
             silent_audio = np.zeros(16000, dtype=np.float32)
             segments, _ = self.model.transcribe(
@@ -280,3 +322,5 @@ class Transcriber:
                 pass
         except Exception:
             pass
+        finally:
+            self._model_lock.release()
