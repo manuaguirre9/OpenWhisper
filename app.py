@@ -246,8 +246,14 @@ if __name__ == '__main__':
 
     tray_menu.addSeparator()
 
+    def quit_app():
+        # Frenar los hilos de la ventana batch primero: Qt aborta el proceso
+        # si destruye un QThread que todavía está corriendo.
+        batch_win.shutdown()
+        app.quit()
+
     quit_action = tray_menu.addAction("Salir")
-    quit_action.triggered.connect(app.quit)
+    quit_action.triggered.connect(quit_app)
     
     tray_icon.setContextMenu(tray_menu)
     tray_icon.setToolTip("Whisper Dictation")

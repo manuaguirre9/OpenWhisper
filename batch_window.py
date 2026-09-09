@@ -453,6 +453,8 @@ class BatchTranscriptionWindow(QMainWindow):
         self.current_index: Optional[int] = None    # being processed
         self.selected_index: Optional[int] = None   # shown in the text area
         self.worker: Optional[TranscriptionWorker] = None
+        # Cancelar detiene la cola entera, no sólo el archivo en curso.
+        self._queue_cancelled = False
 
         # Batch-specific Transcriber cache. Persists across queue runs so the
         # user doesn't re-pay the model load cost when picking the same size.
@@ -479,6 +481,27 @@ class BatchTranscriptionWindow(QMainWindow):
     def showEvent(self, event):
         super().showEvent(event)
         apply_windows_dark_titlebar(self)
+
+    def shutdown(self, timeout_ms: int = 15000):
+        """
+        Frenar los QThread antes de que Qt los destruya.
+
+        Cerrar la ventana es inofensivo — sólo se oculta, el objeto sigue
+        vivo y el worker sigue corriendo. El problema es salir de la app: Qt
+        aborta el proceso si destruye un QThread todavía corriendo. app.py
+        llama a esto desde el "Salir" de la bandeja.
+
+        Al worker de transcripción se le puede pedir cancelación (la chequea
+        entre segmentos); al de carga de modelo y al de descarga no, así que
+        con esos sólo se puede esperar.
+        """
+        self._queue_cancelled = True
+        if self.worker is not None:
+            self.worker.cancel()
+            self.worker.wait(timeout_ms)
+        for thread in (self.loader, self.diar_downloader):
+            if thread is not None:
+                thread.wait(timeout_ms)
 
     # ----- UI construction -----
 
@@ -1173,11 +1196,23 @@ class BatchTranscriptionWindow(QMainWindow):
             if entry.status == ST_RUNNING:
                 entry.status = ST_CANCELLED
                 self._refresh_row(self.current_index)
+        if self._queue_cancelled:
+            self._queue_cancelled = False
+            self.current_index = None
+            self._active_transcriber = None
+            self.progress.setValue(0)
+            self._refresh_buttons()
+            return
         # Move on to the next pending file.
         self._process_next()
 
     def _on_cancel_clicked(self):
         if self.worker is not None:
+            # Sin esto _on_worker_finished encadenaba con _process_next() y
+            # arrancaba el siguiente archivo: cancelar una cola de 3 cancelaba
+            # uno y empezaba otro. Los pendientes quedan en "En cola" para
+            # poder retomar con Transcribir.
+            self._queue_cancelled = True
             self.worker.cancel()
         self.cancel_btn.setEnabled(False)
 
