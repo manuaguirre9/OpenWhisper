@@ -18,7 +18,10 @@ DEFAULT_CONFIG = {
     "ducking_percentage": 30,
     "custom_vocabulary": "",
     "cpu_threads": 0,
-    "beam_size": 1
+    "beam_size": 1,
+    # "segment" = decodificar cada frase mientras hablás (la espera al soltar es
+    # solo la última frase). "oneshot" = todo al final, el camino viejo.
+    "dictation_mode": "segment"
 }
 
 def load_config():

@@ -159,7 +159,19 @@ def short_window(pad_s: float = WINDOW_PAD_S, min_s: float = MIN_WINDOW_S,
     llamando al decoder pelado: 19s de decode para 4,8s de audio). Por el
     pipeline real —que trae VAD y el fallback por compression_ratio— aguanta
     hasta +0,5s en todo lo medido; los 2s del default son margen barato: cada
-    segundo extra de ventana cuesta ~0,08s de encoder.
+    segundo extra de ventana cuesta ~0,08s de encoder. (whisper.cpp expone lo
+    mismo como --audio-ctx y la fórmula empírica de esa comunidad,
+    audio_frames + 128 posiciones, son +2,56s: el mismo número por otro lado.)
+
+    ⚠ ESTO ES SEGURO POR LA COMPAÑÍA QUE TIENE, NO SOLO POR EL PAD. Medido sobre
+    12 notas de voz reales: por este camino (vad_filter=True + initial_prompt +
+    condition_on_previous_text=False) no degeneró ninguna, y el total bajó 1,30x
+    —2,5 a 4x en las notas cortas—. Las MISMAS 12 notas, con el mismo recorte
+    pero sin VAD, sin prompt y con condition_on_previous_text en su default
+    (que es la config del transcriptor de ULTRON), dieron una nota de 10,3s
+    tardando 90,58s: el bucle degenerado, en producción y en silencio. Si vas a
+    llevar este recorte a otro lugar, llevate las tres opciones con él y medí
+    con audio real antes.
     """
     if not enabled or not _install_dynamic_pad():
         yield False
@@ -383,7 +395,8 @@ class OnlineASR:
 
 def transcribe_one_shot(model, audio: np.ndarray, language: Optional[str],
                         beam_size: int = FULL_BEAM,
-                        short_window_enabled: bool = True) -> str:
+                        short_window_enabled: bool = True,
+                        initial_prompt: Optional[str] = None) -> str:
     """
     El decode que hace el dictado: una pasada sobre toda la grabación,
     greedy + VAD. Es la referencia de calidad y de ESPERA que el streaming
@@ -398,7 +411,7 @@ def transcribe_one_shot(model, audio: np.ndarray, language: Optional[str],
             audio,
             language=language,
             beam_size=beam_size,
-            initial_prompt=base_prompt_for(language),
+            initial_prompt=initial_prompt or base_prompt_for(language),
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=FULL_VAD_SILENCE_MS),
             condition_on_previous_text=False,

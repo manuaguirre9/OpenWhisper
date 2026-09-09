@@ -201,3 +201,43 @@ def test_start_is_ignored_while_a_take_is_still_finalizing():
         assert session.recording is False
     finally:
         release_finalize.set()
+
+
+# ------------------------------------------- drenaje en vivo del grabador --
+# El dictado por segmentos consume audio MIENTRAS se graba. Lo único que no
+# puede fallar ahí es la contabilidad: ni un bloque repetido (texto duplicado)
+# ni uno perdido (palabra que no aparece). Se cuenta en muestras a propósito.
+
+def test_drain_new_devuelve_lo_encolado_y_lo_conserva():
+    from audio_capture import AudioRecorder
+
+    rec = AudioRecorder()
+    for i in range(3):
+        rec.q.put(np.full((100, 1), i, dtype=np.float32))
+    nuevo = rec.drain_new()
+    assert len(nuevo) == 300
+    assert list(nuevo[:3]) == [0.0, 0.0, 0.0] and list(nuevo[-3:]) == [2.0, 2.0, 2.0]
+    assert rec.drain_new().size == 0          # ya no queda nada
+    assert len(rec.audio_data) == 3           # pero sigue acumulado
+
+
+def test_drain_new_y_stop_recording_no_pierden_ni_repiten():
+    """El consumidor en vivo se lleva una parte y stop_recording devuelve TODO:
+    el residual es exactamente lo que falta."""
+    from audio_capture import AudioRecorder
+
+    rec = AudioRecorder()
+    rec.is_recording = True
+    for i in range(5):
+        rec.q.put(np.full((100, 1), i, dtype=np.float32))
+    consumido = len(rec.drain_new())           # el hilo alcanza a 5 bloques
+    for i in range(5, 8):
+        rec.q.put(np.full((100, 1), i, dtype=np.float32))
+    completo = rec.stop_recording()
+
+    assert len(completo) == 800
+    residual = completo[consumido:]
+    assert len(residual) == 300
+    assert list(residual[:1]) == [5.0] and list(residual[-1:]) == [7.0]
+    # y el orden de lo hablado se conserva de punta a punta
+    assert list(completo[::100]) == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]

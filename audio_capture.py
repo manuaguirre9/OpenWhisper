@@ -26,6 +26,12 @@ class AudioRecorder:
         self._levels_lock = threading.Lock()
         self._levels = deque(maxlen=self._LEVEL_HISTORY)
 
+        # El dictado por segmentos consume audio MIENTRAS se graba, así que la
+        # cola la vacían dos lados (ese consumidor y stop_recording). El lock
+        # serializa el drenaje: sin él los bloques podrían quedar en
+        # audio_data en otro orden que el que se habló.
+        self._drain_lock = threading.Lock()
+
     def _callback(self, indata, frames, time, status):
         """Called by sounddevice for each audio block (PortAudio thread)."""
         if status:
@@ -41,6 +47,24 @@ class AudioRecorder:
         norm = min(1.0, rms / self._RMS_NORM)
         with self._levels_lock:
             self._levels.append(norm)
+
+    def drain_new(self) -> np.ndarray:
+        """Pasa a `audio_data` lo que el callback haya encolado y lo devuelve.
+
+        Para consumir audio mientras la grabación sigue viva. `audio_data` sigue
+        acumulando TODO, así que `stop_recording()` devuelve la grabación
+        completa igual: quien consuma en vivo tiene que llevar su propia cuenta
+        de cuánto ya procesó.
+        """
+        new = []
+        with self._drain_lock:
+            while not self.q.empty():
+                chunk = self.q.get()
+                self.audio_data.append(chunk)
+                new.append(chunk)
+        if not new:
+            return np.array([], dtype=np.float32)
+        return np.concatenate(new, axis=0).flatten()
 
     def start_recording(self, device_id=None):
         print(f"[AudioRecorder] Starting recording on device: {device_id}...")
@@ -78,8 +102,9 @@ class AudioRecorder:
             finally:
                 self.stream = None
 
-        while not self.q.empty():
-            self.audio_data.append(self.q.get())
+        with self._drain_lock:
+            while not self.q.empty():
+                self.audio_data.append(self.q.get())
 
         if len(self.audio_data) > 0:
             return np.concatenate(self.audio_data, axis=0).flatten()

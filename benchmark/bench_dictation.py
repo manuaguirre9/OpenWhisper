@@ -241,6 +241,77 @@ def run_streaming(model, clip: dict, realtime: bool, min_chunk_s: float,
     }
 
 
+def run_segmented(model, clip: dict, realtime: bool, beam_size: int,
+                  poll_every_s: float = 0.5, release_delay_s: float = 0.0) -> dict:
+    """Camino por SEGMENTOS: decodificar cada frase apenas se cierra.
+
+    Mismo cronómetro que run_streaming — ESPERA es lo que hay entre el último
+    bloque de audio (soltar la tecla) y tener el texto. Acá eso es, por diseño,
+    la decodificación de la ÚLTIMA frase y nada más.
+    """
+    from segment_asr import SegmentASR
+
+    audio, language = clip["audio"], clip["language"]
+    if release_delay_s > 0:
+        audio = np.concatenate([audio, np.zeros(int(release_delay_s * SAMPLE_RATE),
+                                                dtype=np.float32)])
+    errors = []
+    seg = SegmentASR(model, language, beam_size=beam_size, on_error=errors.append)
+
+    audio_q: "queue.Queue[Optional[np.ndarray]]" = queue.Queue()
+    block = int(FEED_BLOCK_S * SAMPLE_RATE)
+    blocks = [audio[i:i + block] for i in range(0, len(audio), block)]
+    state = {}
+
+    def feeder():
+        t0 = time.perf_counter()
+        for i, chunk in enumerate(blocks):
+            if realtime:
+                target = t0 + (i + 1) * FEED_BLOCK_S
+                delay = target - time.perf_counter()
+                if delay > 0:
+                    time.sleep(delay)
+            audio_q.put(chunk)
+        state["t_release"] = time.perf_counter()
+        audio_q.put(None)
+
+    thread = threading.Thread(target=feeder, daemon=True)
+    thread.start()
+
+    seg_times, done, last_poll = [], False, time.perf_counter()
+    while not done:
+        try:
+            chunk = audio_q.get(timeout=0.1)
+        except queue.Empty:
+            chunk = None if False else np.array([], dtype=np.float32)
+        if chunk is None:
+            done = True
+        elif len(chunk):
+            seg.insert_audio(chunk)
+        now = time.perf_counter()
+        if not done and now - last_poll >= poll_every_s:
+            last_poll = now
+            t = time.perf_counter()
+            if seg.poll():
+                seg_times.append(time.perf_counter() - t)
+
+    t_finish = time.perf_counter()
+    text = seg.finish()
+    t_ready = time.perf_counter()
+    return {
+        "text": text,
+        "wait": t_ready - state["t_release"],
+        "final_flush": t_ready - t_finish,
+        "passes": seg.decoded_segments,
+        "pass_avg": statistics.fmean(seg_times) if seg_times else 0.0,
+        "pass_max": max(seg_times) if seg_times else 0.0,
+        "commit_lag_avg": 0.0,
+        "commit_lag_max": 0.0,
+        "failed_passes": seg.failed_segments,
+        "errors": [repr(e) for e in errors],
+    }
+
+
 EMPTY_STREAM = {"text": "", "wait": float("nan"), "passes": 0, "pass_avg": float("nan"),
                 "pass_max": float("nan"), "commit_lag_avg": float("nan"),
                 "commit_lag_max": float("nan"), "failed_passes": 0, "errors": []}
@@ -307,6 +378,19 @@ def parse_args():
     parser.add_argument("--no-realtime", action="store_true",
                         help="alimentar el audio lo más rápido posible (ESPERA deja de tener sentido)")
     parser.add_argument("--skip-oneshot", action="store_true", help="no medir el baseline")
+    parser.add_argument("--release-delay", type=float, default=0.0, metavar="SEG",
+                        help="segundos que el usuario sigue apretando la tecla "
+                             "DESPUÉS de terminar de hablar. Los clips terminan "
+                             "justo en la última sílaba, que es el peor caso; en el "
+                             "uso real hay un beat, y con --live-mode segment ese "
+                             "beat alcanza para decodificar la última frase antes de "
+                             "que sueltes.")
+    parser.add_argument("--live-mode", choices=("stream", "segment"), default="stream",
+                        help="qué se mide en la columna ESPERA: 'stream' = "
+                             "LocalAgreement sobre el buffer entero (texto durante "
+                             "la frase); 'segment' = decodificar cada frase apenas "
+                             "cierra por VAD (texto recién al final de cada frase, "
+                             "pero cada muestra se decodifica una sola vez)")
     parser.add_argument("--skip-streaming", action="store_true",
                         help="medir SOLO el one-shot (que es lo que hace el dictado "
                              "hoy). Sin esto cada corrida alimenta el clip en tiempo "
@@ -351,7 +435,8 @@ def main():
     print(f"Modelos: {', '.join(models)} · beams {beams} · threads {threads} "
           f"· compute {args.compute} · min_chunk {args.min_chunk}s "
           f"· trim {args.trim:.0f}s · full-beam {args.full_beam} "
-          f"· ventana one-shot {'30s fija' if args.no_short_window else 'recortada'}"
+          f"· en vivo: {args.live_mode}"
+          f" · ventana one-shot {'30s fija' if args.no_short_window else 'recortada'}"
           f"{' · ventana streaming recortada' if args.stream_short_window else ''}")
     if not realtime:
         print("⚠  --no-realtime: el audio entra de golpe. ESPERA y atraso NO representan\n   el uso real — este modo sirve solo para comparar throughput bruto de decodificación.")
@@ -364,9 +449,14 @@ def main():
         for clip in clips:
             for beam in beams:
                 for run in range(args.repeat):
-                    stream = (EMPTY_STREAM if args.skip_streaming
-                              else run_streaming(model, clip, realtime, args.min_chunk,
-                                                 beam, args.trim, args.stream_short_window))
+                    if args.skip_streaming:
+                        stream = EMPTY_STREAM
+                    elif args.live_mode == "segment":
+                        stream = run_segmented(model, clip, realtime, beam,
+                                               release_delay_s=args.release_delay)
+                    else:
+                        stream = run_streaming(model, clip, realtime, args.min_chunk,
+                                               beam, args.trim, args.stream_short_window)
                     one_shot = ({"text": "", "wait": float("nan")} if args.skip_oneshot
                                 else run_one_shot(model, clip, args.full_beam,
                                                   not args.no_short_window))
@@ -447,7 +537,18 @@ def report(rows, args):
               f"beam {args.full_beam}.")
         print("=" * 108)
         return
-    slow = [r for r in rows if r["pass_max"] > args.min_chunk]
+    if args.live_mode == "segment":
+        # min_chunk y "atraso" son del streaming por buffer: acá no hay pasadas
+        # compitiendo con el habla, cada frase se decodifica una sola vez cuando
+        # ya cerró. Medirlo contra min_chunk sería inventar una alarma.
+        worst = max((r["pass_max"] for r in rows), default=0.0)
+        print(f"  ·  Modo segmento: cada frase se decodifica una vez al cerrar "
+              f"(la más lenta tardó {worst:.2f}s, mientras el usuario seguía "
+              f"hablando). ESPERA = solo la última frase.")
+        if args.release_delay:
+            print(f"  ·  Con --release-delay {args.release_delay:.1f}s: la tecla se "
+                  f"suelta ese tiempo después de la última sílaba.")
+    slow = [] if args.live_mode == "segment" else [r for r in rows if r["pass_max"] > args.min_chunk]
     if slow:
         combos = sorted({(r["model"], r["beam"]) for r in slow})
         print(f"  ⚠  Pasada más lenta que min_chunk ({args.min_chunk}s) en: "

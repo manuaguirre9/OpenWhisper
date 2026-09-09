@@ -87,11 +87,62 @@ python benchmark/bench_dictation.py --models small --threads 3 --skip-streaming 
 python benchmark/bench_dictation.py --models small --threads 3 --skip-streaming --repeat 2                                   # ahora
 ```
 
+**Validado sobre audio real:** 12 notas de voz en castellano rioplatense (2,7s a
+131s), cero degeneraciones, 207,3s -> 159,1s en total y 2,5-4x en las notas
+cortas. Las mismas 12 notas con el recorte pero SIN `vad_filter` / SIN
+`initial_prompt` / con `condition_on_previous_text` en su default dieron una
+nota de 10,3s tardando **90,58s**: el recorte es seguro por la compañía que
+tiene, no solo por el pad. Si lo llevás a otro proyecto, llevate las tres
+opciones con él.
+
 **En el streaming el mismo recorte ROMPE** y por eso está apagado ahí
 (`--stream-short-window` para re-verificarlo): con `tiny`, una pasada sobre un
 buffer de 3s pasó de 1,5s a 41,7s — sin bastante silencio atrás el modelo no
 emite `<|endoftext|>` y genera hasta `max_length`. Una pasada de streaming es el
 caso peor: buffer corto, prompt largo y `word_timestamps=True`.
+
+## Los tres caminos del dictado
+
+`bench_dictation.py` mide tres formas de llegar al texto. No compiten: cada una
+gana en un caso distinto y el banco dice cuál.
+
+| | cuándo decodifica | ESPERA (small, Pi 5) | WER | para qué sirve |
+|---|---|---|---|---|
+| **one-shot** (`transcribe_one_shot`) | todo al soltar | crece con lo que hablás: 2,6s (4,8s) / 23,7s (47s) | 0,0% | lo más simple; suficiente para dictados cortos |
+| **segmentos** (`segment_asr.SegmentASR`) | cada frase apenas cierra por VAD, mientras seguís hablando | **plana: 2,7s (4,8s) / 2,8s (47s)** | 0,0% | el dictado de verdad |
+| **streaming** (`streaming_core.OnlineASR`) | re-transcribe el buffer entero en cada pasada | 42s / 198s con `small`; solo `tiny` sigue el ritmo | 12-25% con `tiny` | mostrar texto ANTES de que termines la frase |
+
+```bash
+python benchmark/bench_dictation.py --live-mode segment --models small --threads 3
+python benchmark/bench_dictation.py --live-mode segment --release-delay 0.8   # con el beat real de soltar la tecla
+```
+
+### Por qué segmentos y no streaming
+
+Con la ventana del encoder ya recortada, el costo dejó de estar en el encoder y
+pasó al **decoder**, que es autorregresivo y escala con las palabras (clip de
+4,8s: encoder 0,53s, resto 2,08s). No queda nada para exprimir de una sola
+pasada al final: la única forma de que la espera no crezca es decodificar
+mientras el usuario habla. Y la CPU está libre igual — hoy el one-shot no hace
+nada hasta que soltás.
+
+El streaming LocalAgreement re-decodifica cada palabra muchas veces para poder
+mostrarla antes de que la frase termine; en esta Pi `small` no le sigue el ritmo
+ni de cerca. Por segmentos, cada muestra se decodifica **una sola vez**, cuando
+la frase ya cerró, y se paga 0% de WER extra. Además un segmento de VAD termina
+en silencio por construcción, que es justo la condición que le falta a una
+pasada de streaming y que hacía degenerar el recorte de ventana.
+
+Efecto colateral medido: la segmentación **arregla** el descarrilamiento de los
+modelos chicos en audio largo, porque nunca ven más de una frase — `base` en el
+clip de 47s pasó de 59,3% de WER (one-shot) a **6,2%** (segmentos), con la
+espera en 0,82s. Es la opción si querés ~1s y podés pagar ese WER; `small`
+queda en 0,0% con ~2,8s.
+
+**El piso, sin vueltas:** la espera al soltar es la decodificación de la última
+frase menos lo que se alcanzó a solapar. Con `small` en esta Pi eso son ~2,6s
+para una frase de 5s, y ningún cambio de arquitectura lo baja — para eso hace
+falta un modelo más rápido.
 
 ## Building the Executable (.exe)
 If you want to create a standalone executable that runs without installing Python:
