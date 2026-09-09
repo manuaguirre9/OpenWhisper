@@ -32,6 +32,14 @@ MIN_CHUNK_S = 1.0        # minimum new audio before running a streaming pass
 TRIM_BUFFER_S = 20.0     # trim committed audio once the buffer passes this
 KEEP_CONTEXT_S = 1.0     # left context kept after a trim
 MIN_DECODE_S = 0.2       # skip a pass on buffers shorter than this
+COMMIT_NGRAM_MAX = 16    # palabras del final ya comiteado que se buscan para dedup
+                         # (el whisper_streaming original usa 5; MEDIDO acá, es poco:
+                         #  en un clip corto el buffer nunca se recorta, así que la
+                         #  pasada final re-propone desde bastante atrás. Con 5, un
+                         #  solapamiento de 6 palabras dejaba "para" afuera de la
+                         #  ventana, ningún n-grama coincidía y la frase entera salía
+                         #  duplicada: "...cubra el seguro. Para que lo cubra el seguro.")
+MAX_TS_DRIFT_S = 1.5     # cuánto se corren los timestamps entre pasadas (medido ~1s)
 
 # --- decoding ---
 STREAM_BEAM = 1          # greedy during streaming (speed)
@@ -79,12 +87,50 @@ class HypothesisBuffer:
 
     def __init__(self):
         self.buffer: List[Word] = []      # previous pass, still tentative
+        self.committed_tail: List[Word] = []   # últimas comiteadas, para dedup por texto
         self.last_committed_time = 0.0
 
     def insert(self, words, offset: float) -> List[Word]:
-        # Shift buffer-local times to absolute; drop anything we already passed.
+        """Pasa a tiempo absoluto y saca el prefijo que ya se emitió.
+
+        MEDIDO (2026-09-09, clip largo es-AR): los timestamps de una palabra se
+        corren HASTA ~1s entre pasadas, porque cada pasada decodifica una
+        ventana distinta. Con "ya emitido" decidido por tiempo —comparando el
+        comienzo (versión original) o el final (primer intento de arreglo)— la
+        palabra siguiente a la última comiteada cae del lado equivocado de la
+        frontera, queda descartada en TODAS las pasadas siguientes y se pierde
+        en silencio. Trazado real:
+
+            SALTO de frontera 3.94 -> 9.88 comiteando [... 'ahí', 'me']
+            DESCARTA 'puedo' [8.88-9.84]  frontera=9.88
+
+        'puedo' va DESPUÉS de 'me' en el audio, pero viene fechada antes.
+
+        Así que el tiempo decide GRUESO (tirar lo que quedó muy atrás) y el
+        TEXTO decide FINO: se saca el prefijo que repite literalmente la cola
+        ya comiteada, hasta COMMIT_NGRAM_MAX palabras. Es el dedup por n-gramas
+        del whisper_streaming original, que acá faltaba. Falla perdiendo
+        precisión en el dedup (a lo sumo una repetición visible), nunca
+        borrando una palabra que nadie emitió.
+        """
         shifted = [(s + offset, e + offset, w) for (s, e, w) in words]
-        return [t for t in shifted if t[0] > self.last_committed_time - 0.1]
+
+        # Grueso: solo el corrimiento medido de margen. Con más tolerancia (se
+        # probó con KEEP_CONTEXT_S sumado) el prefijo ya emitido sobrevive al
+        # filtro, y en un clip corto —donde el buffer nunca se recorta— la
+        # pasada final re-propone la oración ENTERA desde el principio: el
+        # dedup por n-gramas no la agarra porque compara contra la COLA
+        # comiteada, no contra todo lo emitido, y la frase sale duplicada
+        # (medido: "...cubra el seguro. Para que lo cubra el seguro.").
+        floor = self.last_committed_time - MAX_TS_DRIFT_S
+        new = [t for t in shifted if t[1] > floor]
+
+        # Fino: si el arranque repite el final ya comiteado, se saca por texto.
+        tail = self.committed_tail
+        for n in range(min(len(tail), len(new), COMMIT_NGRAM_MAX), 0, -1):
+            if all(norm_word(tail[-n + i][2]) == norm_word(new[i][2]) for i in range(n)):
+                return new[n:]
+        return new
 
     def flush(self, new_words) -> List[Word]:
         """Commit the agreeing prefix between `new_words` and the prev pass."""
@@ -99,6 +145,9 @@ class HypothesisBuffer:
             else:
                 break
         self.buffer = new           # remainder becomes next pass's reference
+        # La cola comiteada es lo que insert() usa para deduplicar por texto.
+        if committed:
+            self.committed_tail = (self.committed_tail + committed)[-COMMIT_NGRAM_MAX:]
         return committed
 
 

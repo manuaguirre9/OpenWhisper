@@ -107,12 +107,52 @@ def test_flush_stops_at_first_disagreement():
     assert [w[2] for w in committed] == [" a"]   # " c" must NOT be committed
 
 
-def test_insert_shifts_to_absolute_time_and_drops_the_past():
+def test_insert_shifts_to_absolute_time():
     buf = HypothesisBuffer()
-    buf.last_committed_time = 5.0
-    got = buf.insert([(0.0, 0.4, " viejo"), (1.0, 1.4, " nuevo")], offset=4.5)
-    assert [w[2] for w in got] == [" nuevo"]     # 4.5 < 5.0-0.1 -> dropped
+    got = buf.insert([(1.0, 1.4, " nuevo")], offset=4.5)
     assert got[0][0] == pytest.approx(5.5)
+
+
+def test_insert_drops_only_what_quedo_MUY_atras():
+    """El filtro por tiempo es GRUESO a propósito.
+
+    Antes cortaba pegado a la frontera (start > last_committed - 0.1) y eso
+    perdía palabras: los timestamps de una misma palabra se corren hasta ~1s
+    entre pasadas, porque cada pasada decodifica una ventana distinta, así que
+    la palabra siguiente a la última comiteada caía del lado equivocado y
+    quedaba descartada en todas las pasadas siguientes. Medido sobre el clip
+    largo es-AR: 21 palabras perdidas, los huecos del texto.
+    """
+    buf = HypothesisBuffer()
+    buf.last_committed_time = 10.0
+    # frontera 10.0 → piso = 10.0 - MAX_TS_DRIFT_S = 8.5
+    got = buf.insert([(0.0, 0.4, " remoto"), (9.0, 9.4, " cerca")], offset=0.0)
+    assert [w[2] for w in got] == [" cerca"]   # 0.4 quedó atrás del piso; 9.4 no
+
+
+def test_insert_conserva_la_palabra_que_cruza_la_frontera():
+    """El caso exacto del bug: 'puedo' [8.88-9.84] con la frontera en 9.88."""
+    buf = HypothesisBuffer()
+    buf.last_committed_time = 9.88
+    got = buf.insert([(8.88, 9.84, " puedo")], offset=0.0)
+    assert [w[2] for w in got] == [" puedo"]
+
+
+def test_insert_saca_por_TEXTO_lo_que_ya_se_comiteo():
+    """Lo que evita el duplicado es el n-grama, no el reloj."""
+    buf = HypothesisBuffer()
+    buf.committed_tail = [(8.0, 8.4, " bajo"), (8.4, 8.9, " la"), (8.9, 9.4, " sombra")]
+    buf.last_committed_time = 9.4
+    got = buf.insert([(8.5, 9.0, " la"), (9.0, 9.5, " sombra"), (9.5, 9.9, " y")],
+                     offset=0.0)
+    assert [w[2] for w in got] == [" y"]
+
+
+def test_flush_alimenta_la_cola_para_el_dedup():
+    buf = HypothesisBuffer()
+    buf.buffer = [(0.0, 0.5, " hola")]
+    assert [w[2] for w in buf.flush([(0.0, 0.5, " hola")])] == [" hola"]
+    assert [w[2] for w in buf.committed_tail] == [" hola"]
 
 
 # ------------------------------------------------------------- OnlineASR --
