@@ -53,6 +53,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from streaming_core import (  # noqa: E402
     SAMPLE_RATE,
     MIN_CHUNK_S,
+    TRIM_BUFFER_S,
     STREAM_BEAM,
     FULL_BEAM,
     OnlineASR,
@@ -162,7 +163,7 @@ def word_error_rate(reference: str, hypothesis: str) -> float:
 # ------------------------------------------------------------------ passes --
 
 def run_streaming(model, clip: dict, realtime: bool, min_chunk_s: float,
-                  beam_size: int) -> dict:
+                  beam_size: int, trim_buffer_s: float = TRIM_BUFFER_S) -> dict:
     """
     Feed the clip through OnlineASR the way a microphone would, then measure
     the wait between the last audio block (= key release) and the final text.
@@ -171,6 +172,7 @@ def run_streaming(model, clip: dict, realtime: bool, min_chunk_s: float,
     language = clip["language"]
     errors = []
     online = OnlineASR(model, language, beam_size=beam_size,
+                       trim_buffer_s=trim_buffer_s,
                        on_error=errors.append)
 
     audio_q: "queue.Queue[Optional[np.ndarray]]" = queue.Queue()
@@ -286,6 +288,11 @@ def parse_args():
                         help="beam del one-shot (baseline de app.py)")
     parser.add_argument("--threads", type=int, default=0, help="0 = núcleos físicos")
     parser.add_argument("--compute", default="int8", help="compute_type de CTranslate2")
+    parser.add_argument("--trim", type=float, default=TRIM_BUFFER_S, metavar="SEG",
+                        help=f"segundos de buffer antes de recortar "
+                             f"(default: {TRIM_BUFFER_S:.0f}; en la Pi probá 8). "
+                             f"Cada pasada re-transcribe el buffer entero, así "
+                             f"que esto acota el costo por pasada.")
     parser.add_argument("--min-chunk", type=float, default=MIN_CHUNK_S,
                         help="segundos de audio nuevo entre pasadas")
     parser.add_argument("--repeat", type=int, default=1, help="corridas por combinación")
@@ -322,7 +329,8 @@ def main():
 
     print(f"Clips: {', '.join(c['stem'] for c in clips)}")
     print(f"Modelos: {', '.join(models)} · beams {beams} · threads {threads} "
-          f"· compute {args.compute} · min_chunk {args.min_chunk}s")
+          f"· compute {args.compute} · min_chunk {args.min_chunk}s "
+          f"· trim {args.trim:.0f}s")
     if not realtime:
         print("⚠  --no-realtime: el audio entra de golpe. ESPERA y atraso NO representan\n   el uso real — este modo sirve solo para comparar throughput bruto de decodificación.")
     print()
@@ -334,7 +342,8 @@ def main():
         for clip in clips:
             for beam in beams:
                 for run in range(args.repeat):
-                    stream = run_streaming(model, clip, realtime, args.min_chunk, beam)
+                    stream = run_streaming(model, clip, realtime, args.min_chunk,
+                                           beam, args.trim)
                     one_shot = ({"text": "", "wait": float("nan")} if args.skip_oneshot
                                 else run_one_shot(model, clip, args.full_beam))
                     row = {

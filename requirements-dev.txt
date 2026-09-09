@@ -12,6 +12,13 @@ faster-whisper
 numpy
 pytest
 
-# Solo para benchmark/record_clip.py (grabar clips propios desde el micrófono).
-# Si vas a correr el banco sobre clips ya grabados, no hace falta.
+# Solo para las herramientas que usan el micrófono o el teclado:
+# benchmark/record_clip.py (grabar clips propios) y streaming_prototype.py
+# (push-to-talk en vivo). Si vas a correr el banco sobre clips ya grabados,
+# no hace falta ninguna de las dos.
+#
+# OJO en Linux: pynput necesita X11 o permisos de uinput. En una Pi headless
+# por SSH el listener de teclado no arranca — ahí usá bench_dictation.py, que
+# no necesita ni micrófono ni teclado ni pantalla.
 sounddevice
+pynput
