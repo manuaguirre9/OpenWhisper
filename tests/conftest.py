@@ -12,3 +12,13 @@ import os
 import tempfile
 
 os.environ["APPDATA"] = tempfile.mkdtemp(prefix="openwhisper-tests-")
+
+# test_session_threading instala un stub de `faster_whisper` con setdefault para
+# poder correr sin la biblioteca. Si está instalada de verdad, la importamos ACÁ
+# —conftest corre primero— así el setdefault no gana y los tests del recorte de
+# ventana pueden verificar el parche contra el símbolo real. Sin esto el stub se
+# queda pegado para toda la suite y esos tests fallan solo cuando corren juntos.
+try:  # pragma: no cover - depende de la máquina
+    import faster_whisper.transcribe  # noqa: F401
+except Exception:
+    pass

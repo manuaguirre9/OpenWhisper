@@ -7,6 +7,7 @@ from typing import Callable, Optional
 from faster_whisper import WhisperModel
 import numpy as np
 
+from streaming_core import short_window
 from system_info import resolve_cpu_threads
 
 # Initial prompts per language. They bias the model towards proper punctuation
@@ -195,22 +196,27 @@ class Transcriber:
         # (e.g. "gracias por ver el video").
         # condition_on_previous_text=False stops the model from dragging
         # context from prior sentences, which matters for short dictation.
-        segments, info = self.model.transcribe(
-            audio_array,
-            beam_size=self.beam_size,
-            language=language,
-            initial_prompt=prompt,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
-            condition_on_previous_text=False,
-        )
+        # short_window(): Whisper padea siempre a 30s y el encoder corre sobre
+        # esa ventana entera. En un dictado de 5s eso es el 62% de la espera
+        # gastado en encodear silencio. MEDIDO en una Pi 5 (small int8, 3
+        # hilos): 7,2s -> 2,5s, mismo texto. Ver streaming_core.short_window.
+        with short_window():
+            segments, info = self.model.transcribe(
+                audio_array,
+                beam_size=self.beam_size,
+                language=language,
+                initial_prompt=prompt,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
+                condition_on_previous_text=False,
+            )
+
+            text = "".join(segment.text for segment in segments)
 
         print(
             f"[Transcriber] Detected language '{info.language}' "
             f"with probability {info.language_probability:.2f}"
         )
-
-        text = "".join(segment.text for segment in segments)
         return text.strip()
 
     def transcribe_file(self, audio_path, language=None, segment_cb=None, cancel_check=None):

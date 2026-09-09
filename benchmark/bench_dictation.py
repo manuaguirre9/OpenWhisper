@@ -163,7 +163,8 @@ def word_error_rate(reference: str, hypothesis: str) -> float:
 # ------------------------------------------------------------------ passes --
 
 def run_streaming(model, clip: dict, realtime: bool, min_chunk_s: float,
-                  beam_size: int, trim_buffer_s: float = TRIM_BUFFER_S) -> dict:
+                  beam_size: int, trim_buffer_s: float = TRIM_BUFFER_S,
+                  short_window: bool = False) -> dict:
     """
     Feed the clip through OnlineASR the way a microphone would, then measure
     the wait between the last audio block (= key release) and the final text.
@@ -173,7 +174,8 @@ def run_streaming(model, clip: dict, realtime: bool, min_chunk_s: float,
     errors = []
     online = OnlineASR(model, language, beam_size=beam_size,
                        trim_buffer_s=trim_buffer_s,
-                       on_error=errors.append)
+                       on_error=errors.append,
+                       short_window_enabled=short_window)
 
     audio_q: "queue.Queue[Optional[np.ndarray]]" = queue.Queue()
     block = int(FEED_BLOCK_S * SAMPLE_RATE)
@@ -239,11 +241,17 @@ def run_streaming(model, clip: dict, realtime: bool, min_chunk_s: float,
     }
 
 
-def run_one_shot(model, clip: dict, beam_size: int) -> dict:
+EMPTY_STREAM = {"text": "", "wait": float("nan"), "passes": 0, "pass_avg": float("nan"),
+                "pass_max": float("nan"), "commit_lag_avg": float("nan"),
+                "commit_lag_max": float("nan"), "failed_passes": 0, "errors": []}
+
+
+def run_one_shot(model, clip: dict, beam_size: int, short_window: bool = True) -> dict:
     """What app.py does today: the entire decode happens after release."""
     t0 = time.perf_counter()
     text = transcribe_one_shot(model, clip["audio"], clip["language"],
-                               beam_size=beam_size)
+                               beam_size=beam_size,
+                               short_window_enabled=short_window)
     return {"text": text, "wait": time.perf_counter() - t0}
 
 
@@ -299,6 +307,18 @@ def parse_args():
     parser.add_argument("--no-realtime", action="store_true",
                         help="alimentar el audio lo más rápido posible (ESPERA deja de tener sentido)")
     parser.add_argument("--skip-oneshot", action="store_true", help="no medir el baseline")
+    parser.add_argument("--skip-streaming", action="store_true",
+                        help="medir SOLO el one-shot (que es lo que hace el dictado "
+                             "hoy). Sin esto cada corrida alimenta el clip en tiempo "
+                             "real, así que un clip de 47s cuesta 47s aunque solo "
+                             "quieras el baseline.")
+    parser.add_argument("--no-short-window", action="store_true",
+                        help="one-shot: padear siempre a 30s como hace Whisper por "
+                             "default (sirve para el antes/después del recorte)")
+    parser.add_argument("--stream-short-window", action="store_true",
+                        help="streaming: recortar también la ventana de cada pasada. "
+                             "MEDIDO: rompe (una pasada de 3s pasó a tardar 41s). "
+                             "Está para poder re-verificarlo, no para usarlo.")
     parser.add_argument("--target-wait", type=float, default=0.5,
                         help="objetivo de ESPERA en segundos (Wispr-Flow-like)")
     parser.add_argument("--json", default="", help="escribir resultados crudos a este archivo")
@@ -330,7 +350,9 @@ def main():
     print(f"Clips: {', '.join(c['stem'] for c in clips)}")
     print(f"Modelos: {', '.join(models)} · beams {beams} · threads {threads} "
           f"· compute {args.compute} · min_chunk {args.min_chunk}s "
-          f"· trim {args.trim:.0f}s")
+          f"· trim {args.trim:.0f}s · full-beam {args.full_beam} "
+          f"· ventana one-shot {'30s fija' if args.no_short_window else 'recortada'}"
+          f"{' · ventana streaming recortada' if args.stream_short_window else ''}")
     if not realtime:
         print("⚠  --no-realtime: el audio entra de golpe. ESPERA y atraso NO representan\n   el uso real — este modo sirve solo para comparar throughput bruto de decodificación.")
     print()
@@ -342,10 +364,12 @@ def main():
         for clip in clips:
             for beam in beams:
                 for run in range(args.repeat):
-                    stream = run_streaming(model, clip, realtime, args.min_chunk,
-                                           beam, args.trim)
+                    stream = (EMPTY_STREAM if args.skip_streaming
+                              else run_streaming(model, clip, realtime, args.min_chunk,
+                                                 beam, args.trim, args.stream_short_window))
                     one_shot = ({"text": "", "wait": float("nan")} if args.skip_oneshot
-                                else run_one_shot(model, clip, args.full_beam))
+                                else run_one_shot(model, clip, args.full_beam,
+                                                  not args.no_short_window))
                     row = {
                         "model": model_size,
                         "clip": clip["stem"],
@@ -354,7 +378,9 @@ def main():
                         "run": run + 1,
                         "threads": threads,
                         "realtime": realtime,
-                        "wer_stream": word_error_rate(clip["reference"], stream["text"]),
+                        "short_window": not args.no_short_window,
+                        "wer_stream": (float("nan") if args.skip_streaming
+                                       else word_error_rate(clip["reference"], stream["text"])),
                         "wer_full": (float("nan") if args.skip_oneshot
                                      else word_error_rate(clip["reference"], one_shot["text"])),
                         "wait_stream": stream["wait"],
@@ -412,6 +438,15 @@ def report(rows, args):
               f"{avg('commit_lag_avg'):>7.1f}s{flag}")
 
     print("-" * 108)
+    if args.skip_streaming:
+        # Sin streaming medido no hay ESPERA que juzgar. Los veredictos de abajo
+        # comparan contra NaN, y NaN > x es False: el reporte diría "✓ todas bajo
+        # el objetivo" justo cuando no midió ninguna.
+        print(f"  ·  Streaming no medido (--skip-streaming). La columna 'hoy' es "
+              f"la ESPERA real del dictado: {'ventana 30s fija' if args.no_short_window else 'ventana recortada'}, "
+              f"beam {args.full_beam}.")
+        print("=" * 108)
+        return
     slow = [r for r in rows if r["pass_max"] > args.min_chunk]
     if slow:
         combos = sorted({(r["model"], r["beam"]) for r in slow})

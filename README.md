@@ -66,6 +66,33 @@ python benchmark/record_clip.py dictado-largo --seconds 45
 
 Unit tests for the streaming logic and the WER: `pytest`.
 
+### Medido: la ventana del encoder (Raspberry Pi 5, `small` int8, 3 hilos)
+
+Whisper padea **siempre** a 30 segundos y el encoder corre sobre esa ventana
+entera, hables 2 segundos o 25. En un dictado de 4,8s eso son 4,4s de los 7,2s
+de ESPERA gastados en encodear silencio. `streaming_core.short_window()` padea
+solo lo que hace falta, y `FULL_BEAM` bajó de 5 a 1 (que es lo que el dictado ya
+usaba de verdad — `config["beam_size"]`, default 1):
+
+| clip | antes | ahora | gana | WER |
+|---|---|---|---|---|
+| es-AR 4,8s | 8,04s | **2,62s** | 3,1x | 0,0% en los dos |
+| en 10,5s | 9,61s | **4,33s** | 2,2x | 0,0% en los dos |
+| es-AR 47,1s | 34,09s | **23,71s** | 1,4x | 0,0% en los dos |
+
+El texto sale idéntico. Reproducible con:
+
+```bash
+python benchmark/bench_dictation.py --models small --threads 3 --skip-streaming --repeat 2 --no-short-window --full-beam 5   # antes
+python benchmark/bench_dictation.py --models small --threads 3 --skip-streaming --repeat 2                                   # ahora
+```
+
+**En el streaming el mismo recorte ROMPE** y por eso está apagado ahí
+(`--stream-short-window` para re-verificarlo): con `tiny`, una pasada sobre un
+buffer de 3s pasó de 1,5s a 41,7s — sin bastante silencio atrás el modelo no
+emite `<|endoftext|>` y genera hasta `max_length`. Una pasada de streaming es el
+caso peor: buffer corto, prompt largo y `word_timestamps=True`.
+
 ## Building the Executable (.exe)
 If you want to create a standalone executable that runs without installing Python:
 1. Ensure `pyinstaller` is installed: `pip install pyinstaller`.

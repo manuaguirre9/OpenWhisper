@@ -19,7 +19,10 @@ unstable tail is re-decoded next pass. Once the buffer grows past
 TRIM_BUFFER_S, already-committed audio is trimmed off (keeping
 KEEP_CONTEXT_S of left context), so cost stays bounded on long dictations.
 """
+import contextlib
+import math
 import re
+import threading
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
@@ -43,7 +46,22 @@ MAX_TS_DRIFT_S = 1.5     # cuánto se corren los timestamps entre pasadas (medid
 
 # --- decoding ---
 STREAM_BEAM = 1          # greedy during streaming (speed)
-FULL_BEAM = 5            # matches app.py's one-shot decode (quality baseline)
+FULL_BEAM = 1            # el decode del dictado real (transcription_engine.py usa
+                         # config["beam_size"], default 1). Estuvo en 5 y NO era el
+                         # baseline de la app: inflaba la columna "hoy" del banco.
+                         # MEDIDO (Pi 5, small int8, 3 hilos): beam 5 cuesta +21% en
+                         # el clip de 47s (33,4s contra 27,6s) y +2% en el de 4,8s,
+                         # con el MISMO texto — 0,0% de WER en los dos, en los dos beams.
+
+# --- ventana del encoder ---
+# Whisper padea SIEMPRE a 30s y el encoder corre sobre esa ventana entera, hable
+# quien hable 2 segundos o 25. MEDIDO en la Pi (small int8, clip de 4,8s): de los
+# 7,2s de espera, 4,4s son encoder y 2,8s decoder — o sea que el 62% del costo es
+# encodear silencio. Padear solo lo necesario es el único lugar donde estaba la
+# grasa, y sale casi gratis en calidad (ver short_window()).
+FULL_WINDOW_FRAMES = 3000    # 30s: lo que asume el pad_or_trim de faster-whisper
+WINDOW_PAD_S = 2.0           # silencio que se le deja DESPUÉS del audio
+MIN_WINDOW_S = 5.0           # piso: nunca una ventana más corta que esto
 STREAM_VAD_SILENCE_MS = 300
 FULL_VAD_SILENCE_MS = 500
 PROMPT_TAIL_CHARS = 200  # how much committed text is fed back as prompt
@@ -74,6 +92,87 @@ def norm_word(word: str) -> str:
 def join_words(words) -> str:
     """faster-whisper word tokens already carry a leading space; join raw."""
     return re.sub(r"\s+", " ", "".join(w[2] for w in words)).strip()
+
+
+_window_tls = threading.local()
+_pad_or_trim_patched = False
+
+
+def _install_dynamic_pad() -> bool:
+    """Reemplaza `faster_whisper.transcribe.pad_or_trim` por una versión que
+    padea lo que hace falta en vez de 3000 frames fijos.
+
+    Se hace por parche porque la biblioteca no expone ningún otro punto: el
+    padeo está hardcodeado adentro del loop de `generate_segments`, y es UN
+    símbolo el que cubre los tres usos (la ventana de cada seek, el batched y la
+    detección de idioma). El parche se instala una vez y es INERTE por default:
+    solo cambia algo para el hilo que esté adentro de `short_window()`, así ni
+    otro hilo ni el pipeline batched (que apila features y necesita que todas
+    midan lo mismo) ven nada distinto.
+    """
+    global _pad_or_trim_patched
+    if _pad_or_trim_patched:
+        return True
+    try:
+        import faster_whisper.transcribe as fw
+    except Exception:
+        return False
+
+    original = fw.pad_or_trim
+
+    def dynamic_pad_or_trim(array, length: int = FULL_WINDOW_FRAMES, *, axis: int = -1):
+        pad = getattr(_window_tls, "pad_frames", None)
+        if pad is not None and length == FULL_WINDOW_FRAMES:
+            floor = getattr(_window_tls, "min_frames", 0)
+            # Nunca menos de lo que ya mide el array: recortar audio sería
+            # perder palabras, que es justo lo contrario de lo que se busca.
+            length = min(length, max(floor, array.shape[axis] + pad))
+        return original(array, length, axis=axis)
+
+    fw.pad_or_trim = dynamic_pad_or_trim
+    _pad_or_trim_patched = True
+    return True
+
+
+@contextlib.contextmanager
+def short_window(pad_s: float = WINDOW_PAD_S, min_s: float = MIN_WINDOW_S,
+                 enabled: bool = True):
+    """Adentro de este `with`, Whisper encodea `audio + pad_s` en vez de 30s.
+
+    MEDIDO (Pi 5, small int8, beam 1, 3 hilos; espera de punta a punta por el
+    pipeline REAL de faster-whisper, VAD y fallbacks incluidos):
+
+        audio    30s (hoy)   ventana corta
+         2,0s       5,91s        1,27s   (4,7x)
+         4,8s       7,27s        2,55s   (2,9x)
+         6,0s       6,89s        2,50s   (2,8x)
+        10,0s       8,96s        4,52s   (2,0x)
+        16,0s      11,73s        8,09s   (1,4x)
+        >29s          igual: la ventana ya era de 30s
+
+    El texto sale IDÉNTICO en los 5 casos y en 3 clips distintos (es-AR corto,
+    es-AR largo recortado, en). En un recorte de 8s la ventana corta salió
+    MEJOR: agarró "Lo del parque", que la de 30s se comía.
+
+    El pad importa: sin suficiente silencio atrás el modelo no emite
+    <|endoftext|>, sigue generando y repite la frase hasta max_length (medido,
+    llamando al decoder pelado: 19s de decode para 4,8s de audio). Por el
+    pipeline real —que trae VAD y el fallback por compression_ratio— aguanta
+    hasta +0,5s en todo lo medido; los 2s del default son margen barato: cada
+    segundo extra de ventana cuesta ~0,08s de encoder.
+    """
+    if not enabled or not _install_dynamic_pad():
+        yield False
+        return
+    prev_pad = getattr(_window_tls, "pad_frames", None)
+    prev_min = getattr(_window_tls, "min_frames", None)
+    _window_tls.pad_frames = int(math.ceil(pad_s * 100))       # 100 frames de mel = 1s
+    _window_tls.min_frames = int(math.ceil(min_s * 100))
+    try:
+        yield True
+    finally:
+        _window_tls.pad_frames = prev_pad
+        _window_tls.min_frames = prev_min
 
 
 class HypothesisBuffer:
@@ -171,12 +270,30 @@ class OnlineASR:
         beam_size: int = STREAM_BEAM,
         trim_buffer_s: float = TRIM_BUFFER_S,
         on_error: Optional[Callable[[BaseException], None]] = None,
+        short_window_enabled: bool = False,
     ):
         self.model = model
         self.language = language
         self.beam_size = beam_size
         self.trim_buffer_s = trim_buffer_s
         self.on_error = on_error
+        # APAGADO A PROPÓSITO. El recorte de ventana (short_window) es 3x en el
+        # one-shot y acá ROMPE: MEDIDO en la Pi con tiny, trim 3s, min_chunk 2s,
+        # los dos clips es-AR —
+        #
+        #     clip     espera            pasada más lenta      WER
+        #     4,8s      3,75s -> 42,32s   1,50s -> 41,66s   25% -> 50%
+        #    47,1s      8,61s -> 198,08s  2,48s -> 41,40s   13% ->  9,7%
+        #
+        # 41s de decode para un buffer de 3s con `tiny` es el modelo generando
+        # hasta max_length: sin bastante silencio atrás no emite <|endoftext|>.
+        # Una pasada de streaming es justo el caso peor — buffer corto, prompt
+        # largo (la cola ya comiteada) y word_timestamps=True. El one-shot no
+        # tiene nada de eso y por eso sí aguanta.
+        #
+        # Queda como flag y no borrado para que el hallazgo se pueda reproducir
+        # (bench: --stream-short-window) el día que se toque el prompt o el trim.
+        self.short_window_enabled = short_window_enabled
         self.base_prompt = base_prompt_for(language)
         self.audio = np.array([], dtype=np.float32)
         self.time_offset = 0.0        # seconds trimmed off the front
@@ -202,25 +319,26 @@ class OnlineASR:
         if len(self.audio) < int(MIN_DECODE_S * SAMPLE_RATE):
             return []
         try:
-            segments, _ = self.model.transcribe(
-                self.audio,
-                language=self.language,
-                beam_size=self.beam_size,
-                word_timestamps=True,
-                condition_on_previous_text=False,
-                initial_prompt=self._prompt(),
-                # VAD ON even on partial buffers: strips the trailing silence so
-                # Whisper doesn't hallucinate long token runs over it (that was
-                # blowing up decode time). Stable words still come from
-                # LocalAgreement.
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=STREAM_VAD_SILENCE_MS),
-            )
-            words: List[Word] = []
-            for seg in segments:
-                for w in (seg.words or []):
-                    words.append((w.start, w.end, w.word))
-            return words
+            with short_window(enabled=self.short_window_enabled):
+                segments, _ = self.model.transcribe(
+                    self.audio,
+                    language=self.language,
+                    beam_size=self.beam_size,
+                    word_timestamps=True,
+                    condition_on_previous_text=False,
+                    initial_prompt=self._prompt(),
+                    # VAD ON even on partial buffers: strips the trailing silence so
+                    # Whisper doesn't hallucinate long token runs over it (that was
+                    # blowing up decode time). Stable words still come from
+                    # LocalAgreement.
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=STREAM_VAD_SILENCE_MS),
+                )
+                words: List[Word] = []
+                for seg in segments:
+                    for w in (seg.words or []):
+                        words.append((w.start, w.end, w.word))
+                return words
         except Exception as exc:  # noqa: BLE001 - one bad pass must not kill the loop
             self.failed_passes += 1
             if self.on_error is not None:
@@ -264,19 +382,25 @@ class OnlineASR:
 
 
 def transcribe_one_shot(model, audio: np.ndarray, language: Optional[str],
-                        beam_size: int = FULL_BEAM) -> str:
+                        beam_size: int = FULL_BEAM,
+                        short_window_enabled: bool = True) -> str:
     """
-    The decode app.py does today: one pass over the whole recording,
-    beam=5 + VAD. This is the quality/latency baseline streaming has to beat
-    on the wait-after-release.
+    El decode que hace el dictado: una pasada sobre toda la grabación,
+    greedy + VAD. Es la referencia de calidad y de ESPERA que el streaming
+    tiene que ganarle.
+
+    `short_window_enabled` recorta la ventana del encoder a lo que dura el
+    audio (ver short_window(): 2,9x en un dictado de 5s, mismo texto). Se puede
+    apagar para medir el antes/después sin tocar el resto.
     """
-    segments, _ = model.transcribe(
-        audio,
-        language=language,
-        beam_size=beam_size,
-        initial_prompt=base_prompt_for(language),
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=FULL_VAD_SILENCE_MS),
-        condition_on_previous_text=False,
-    )
-    return "".join(s.text for s in segments).strip()
+    with short_window(enabled=short_window_enabled):
+        segments, _ = model.transcribe(
+            audio,
+            language=language,
+            beam_size=beam_size,
+            initial_prompt=base_prompt_for(language),
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=FULL_VAD_SILENCE_MS),
+            condition_on_previous_text=False,
+        )
+        return "".join(s.text for s in segments).strip()
