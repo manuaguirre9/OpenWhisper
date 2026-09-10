@@ -564,4 +564,7 @@ if __name__ == '__main__':
     tray_icon.activated.connect(on_tray_activated)
     tray_icon.show()
 
+    if "--batch" in sys.argv[1:]:
+        show_batch()
+
     sys.exit(app.exec())

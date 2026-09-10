@@ -187,11 +187,13 @@ class TranscriptionWorker(QThread):
     failed = pyqtSignal(str)
 
     def __init__(self, transcriber, audio_path, language=None,
-                 diarize=False, num_speakers=None, diarizer=None, parent=None):
+                 diarize=False, num_speakers=None, diarizer=None, parent=None,
+                 task="transcribe"):
         super().__init__(parent)
         self.transcriber = transcriber
         self.audio_path = audio_path
         self.language = language
+        self.task = task
         self.diarize = diarize
         self.num_speakers = num_speakers
         self.diarizer = diarizer  # Diarizer instance (pre-built and cached)
@@ -214,6 +216,7 @@ class TranscriptionWorker(QThread):
                 language=self.language,
                 segment_cb=on_segment,
                 cancel_check=lambda: self._cancelled,
+                task=self.task,
             )
             if self._cancelled:
                 return
@@ -523,6 +526,35 @@ class BatchTranscriptionWindow(QMainWindow):
         model_row.addWidget(self.model_status_label, stretch=1)
         layout.addLayout(model_row)
         self._refresh_model_status()
+
+        # Idioma del audio y traducción. Antes se usaba el idioma del dictado
+        # sin poder cambiarlo; un archivo puede venir en cualquier idioma.
+        lang_row = QHBoxLayout()
+        lang_row.setSpacing(10)
+        lang_label = QLabel("Idioma del audio")
+        lang_label.setMinimumWidth(100)
+        self.lang_combo = QComboBox()
+        for code, name in (
+            (None, "Autodetectar"), ("es", "Español"), ("en", "Inglés"),
+            ("pt", "Portugués"), ("it", "Italiano"), ("fr", "Francés"),
+            ("de", "Alemán"), ("ca", "Catalán"), ("ja", "Japonés"), ("zh", "Chino"),
+        ):
+            self.lang_combo.addItem(name, userData=code)
+        cfg_lang = (self.config_provider() or {}).get("language")
+        idx = self.lang_combo.findData(None if cfg_lang in (None, "auto") else cfg_lang)
+        if idx >= 0:
+            self.lang_combo.setCurrentIndex(idx)
+        lang_row.addWidget(lang_label)
+        lang_row.addWidget(self.lang_combo)
+        lang_row.addSpacing(20)
+        self.translate_checkbox = QCheckBox("Traducir al inglés")
+        self.translate_checkbox.setToolTip(
+            "Whisper solo sabe traducir hacia el inglés. El texto sale en inglés "
+            "sea cual sea el idioma del audio."
+        )
+        lang_row.addWidget(self.translate_checkbox)
+        lang_row.addStretch(1)
+        layout.addLayout(lang_row)
 
         # Diarization controls
         diar_row = QHBoxLayout()
@@ -1016,10 +1048,8 @@ class BatchTranscriptionWindow(QMainWindow):
         transcriber = self._active_transcriber
         if transcriber is None:
             return
-        config = self.config_provider() or {}
-        lang = config.get("language") or None
-        if lang == "auto":
-            lang = None
+        lang = self.lang_combo.currentData()
+        task = "translate" if self.translate_checkbox.isChecked() else "transcribe"
 
         diarize = self.diar_checkbox.isChecked() and self.diarizer is not None
         num_speakers = self.speakers_combo.currentData() if diarize else None
@@ -1034,6 +1064,7 @@ class BatchTranscriptionWindow(QMainWindow):
             diarize=diarize,
             num_speakers=num_speakers,
             diarizer=self.diarizer if diarize else None,
+            task=task,
         )
         self.worker.phase_changed.connect(self._on_phase_changed)
         self.worker.progress.connect(self._on_progress)

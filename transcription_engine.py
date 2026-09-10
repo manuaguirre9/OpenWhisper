@@ -219,7 +219,8 @@ class Transcriber:
         )
         return text.strip()
 
-    def transcribe_file(self, audio_path, language=None, segment_cb=None, cancel_check=None):
+    def transcribe_file(self, audio_path, language=None, segment_cb=None, cancel_check=None,
+                        task="transcribe"):
         """
         Transcribe a long audio file (mp3/wav/m4a/mp4/ogg/flac/...).
         faster-whisper decodes via its bundled av/ffmpeg, so any container
@@ -235,11 +236,14 @@ class Transcriber:
                     for completion.
         cancel_check: optional callable() returning True to abort early.
         """
-        prompt = self._build_prompt(language)
+        # task="translate" traduce al inglés (es lo único que Whisper sabe
+        # traducir). El prompt va en inglés en ese caso: es el idioma de salida.
+        prompt = self._build_prompt("en" if task == "translate" else language)
         segments_gen, info = self.model.transcribe(
             audio_path,
             beam_size=5,
             language=language,
+            task=task,
             initial_prompt=prompt,
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=500),
