@@ -171,8 +171,12 @@ también en Configuración):
 
 | modo | cómo se usa | qué ves mientras hablás | cuándo se escribe en el destino |
 |---|---|---|---|
-| `hold` (default) | mantenés Ctrl+Win | el texto en vivo en el widget flotante | todo al soltar (~0,1s con Moonshine) |
+| `hold` (default) | mantenés Ctrl+Win | el globo de dictado abajo al centro, con el texto en vivo | todo al soltar (~0,1s con Moonshine) |
 | `toggle` | pulsás Ctrl+Win para empezar y otra vez para terminar | lo mismo | **cada frase apenas cierra**, mientras seguís hablando |
+
+El globo (`dictation_bubble.py`) aparece cuando empieza la toma, crece con el
+texto y se desvanece al terminar. No acepta foco ni clics: lo que se escribe
+sigue yendo a la ventana que tenías activa.
 
 En los dos modos los parciales (que Moonshine reescribe) solo se muestran; al
 destino van únicamente frases cerradas, que son definitivas. `text_injector.py`

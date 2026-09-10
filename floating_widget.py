@@ -13,7 +13,7 @@ import numpy as np
 
 from PyQt6.QtWidgets import QWidget
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPointF, QRectF
-from PyQt6.QtGui import QFont, QFontMetrics, QPainter, QColor, QPen
+from PyQt6.QtGui import QFont, QPainter, QColor, QPen
 
 from config_manager import load_config, save_config
 
@@ -31,8 +31,8 @@ class FloatingWidget(QWidget):
     # Reports model-download progress as an integer percentage 0..100.
     # Only meaningful in the 'loading' state.
     update_loading_progress_signal = pyqtSignal(int)
-    # Texto en vivo mientras se graba: lo que ya cerró más el parcial de la
-    # frase en curso. Vacío = solo la onda.
+    # Texto en vivo de la toma (frases cerradas + parcial). La píldora no lo
+    # dibuja: app.py lo conecta al globo de dictado (dictation_bubble.py).
     update_text_signal = pyqtSignal(str)
 
     NUM_BARS = 26
@@ -40,8 +40,6 @@ class FloatingWidget(QWidget):
     # around the pill that could be misread as a frame.
     WIDGET_W = 220
     WIDGET_H = 44
-    # Ancho cuando hay texto en vivo que mostrar.
-    LIVE_W = 420
     PILL_INSET_X = 0
     PILL_TOP = 0
     PILL_HEIGHT = WIDGET_H
@@ -78,11 +76,9 @@ class FloatingWidget(QWidget):
 
         # Loading % shown in the loading state (None = generic "Cargando IA…").
         self._loading_percent = None
-        self._live_text = ""
 
         self.update_ui_signal.connect(self.handle_state_change)
         self.update_loading_progress_signal.connect(self._handle_loading_progress)
-        self.update_text_signal.connect(self._set_live_text)
         self.oldPos = None
 
         self._timer = QTimer(self)
@@ -124,37 +120,11 @@ class FloatingWidget(QWidget):
         self._timer.start(interval)
         if state == "recording":
             self._bar_levels[:] = 0.0
-            self._live_text = ""
-        if state in ("ready", "loading"):
-            self._live_text = ""
-        self._fit_width()
         # Drop the cached loading % when we leave the loading state, so a
         # later reload starts from "Cargando IA…" instead of stale 100%.
         if state != "loading":
             self._loading_percent = None
         self.update()
-
-    def _set_live_text(self, text):
-        self._live_text = (text or "").strip()
-        if self.state in ("recording", "processing"):
-            self._fit_width()
-            self.update()
-
-    def _fit_width(self):
-        """Ensancha la píldora cuando hay texto en vivo y la vuelve a su tamaño
-        cuando no. Si al ensanchar se sale de la pantalla, la corre a la
-        izquierda; la posición guardada en config no se toca."""
-        want = self.LIVE_W if (self._live_text and self.state in ("recording", "processing")) else self.WIDGET_W
-        if self.width() == want:
-            return
-        x, y = self.pos().x(), self.pos().y()
-        try:
-            from PyQt6.QtWidgets import QApplication
-            screen = QApplication.primaryScreen().availableGeometry()
-            x = max(screen.left(), min(x, screen.right() - want))
-        except Exception:
-            pass
-        self.setGeometry(x, y, want, self.WIDGET_H)
 
     def _handle_loading_progress(self, percent):
         # Clamp and ignore obviously invalid values.
@@ -281,40 +251,16 @@ class FloatingWidget(QWidget):
                         color=WF_ON_SURFACE_MUTED, size=9)
 
     def _paint_recording(self, painter, rect):
-        if self._live_text:
-            # Onda comprimida a la izquierda, el texto en vivo ocupa el resto.
-            # Se muestra la COLA del texto (lo último que se dijo), elidida a
-            # la izquierda, que es lo que el usuario quiere ver mientras habla.
-            bars_left = rect.left() + 14
-            bars_right = rect.left() + 78
-            self._draw_bars(painter, bars_left, bars_right, rect, WF_ACCENT_RECORDING)
-            self._draw_live_text(painter, rect, bars_right + 20)
-            return
         # No text, no icon — the symmetric waveform fills the pill and is
         # the only indicator. This is the WhisperFlow look.
         bars_left = rect.left() + 14
         bars_right = rect.right() - 14
         self._draw_bars(painter, bars_left, bars_right, rect, WF_ACCENT_RECORDING)
 
-    def _draw_live_text(self, painter, rect, left):
-        font = QFont("Segoe UI", 10, QFont.Weight.Normal)
-        painter.setFont(font)
-        painter.setPen(WF_ON_SURFACE)
-        width = rect.right() - left - 14
-        text = QFontMetrics(font).elidedText(self._live_text, Qt.TextElideMode.ElideLeft, int(width))
-        painter.drawText(
-            QRectF(left, rect.top(), width, rect.height()),
-            int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
-            text,
-        )
-
     def _paint_processing(self, painter, rect):
         # Three dots traveling in a small wave pattern.
         cx = rect.center().x() - 16
         cy = rect.center().y()
-        if self._live_text:
-            cx = rect.left() + 24
-            self._draw_live_text(painter, rect, rect.left() + 90)
         painter.setPen(Qt.PenStyle.NoPen)
         for i in range(3):
             phase = self._anim_phase * 1.8 - i * 0.7

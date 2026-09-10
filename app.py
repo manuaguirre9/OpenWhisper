@@ -15,6 +15,7 @@ from config_manager import load_config
 from settings_ui import SettingsWindow
 from audio_ducking import AudioDucker
 from floating_widget import FloatingWidget
+from dictation_bubble import DictationBubble
 from batch_window import BatchTranscriptionWindow
 from text_injector import paste_text, type_text, wait_modifiers_released
 
@@ -445,6 +446,13 @@ if __name__ == '__main__':
     # UI
     ui = FloatingWidget()
     ui.show()
+
+    # Globo de dictado: aparece abajo al centro cuando empieza la toma, muestra
+    # el texto a medida que se reconoce y desaparece cuando termina. Escucha
+    # las mismas señales que la píldora.
+    bubble = DictationBubble()
+    ui.update_ui_signal.connect(bubble.handle_state_change)
+    ui.update_text_signal.connect(bubble.set_text)
 
     # Orchestrator
     orchestrator = Orchestrator(ui)
