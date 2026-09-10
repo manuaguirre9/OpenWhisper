@@ -12,6 +12,8 @@ from theme import WINDOW_QSS, apply_windows_dark_titlebar
 
 class SettingsWindow(QWidget):
     settings_saved = pyqtSignal(dict)
+    # Pedido de abrir la ventana de transcripción de archivos (app.py la conecta).
+    open_batch = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -157,6 +159,10 @@ class SettingsWindow(QWidget):
 
         # --- Save button ---
         button_row = QHBoxLayout()
+        self.batch_btn = QPushButton("Transcribir archivo…")
+        self.batch_btn.setToolTip("Transcribir un archivo de audio o video, con identificación de hablantes")
+        self.batch_btn.clicked.connect(self.open_batch.emit)
+        button_row.addWidget(self.batch_btn)
         button_row.addStretch()
         self.save_btn = QPushButton("Guardar")
         self.save_btn.setObjectName("primary")

@@ -7,7 +7,7 @@ from pynput import keyboard
 
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 from PyQt6.QtCore import Qt, QObject
-from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor
+from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QCursor
 
 from audio_capture import AudioRecorder
 from segment_asr import SegmentASR
@@ -532,8 +532,17 @@ if __name__ == '__main__':
     tray_icon = QSystemTrayIcon(create_tray_icon_pixmap(), app)
     tray_menu = QMenu()
 
+    def show_batch():
+        batch_win.show()
+        batch_win.raise_()
+        batch_win.activateWindow()
+
     batch_action = tray_menu.addAction("Transcribir archivo…")
-    batch_action.triggered.connect(lambda: (batch_win.show(), batch_win.raise_(), batch_win.activateWindow()))
+    batch_action.triggered.connect(show_batch)
+    # También desde Configuración, y con doble clic en el ícono: sin la píldora
+    # flotante, el ícono de la bandeja es la única puerta y suele quedar
+    # escondido en el desbordamiento de Windows.
+    settings_win.open_batch.connect(show_batch)
 
     config_action = tray_menu.addAction("Configuración")
     config_action.triggered.connect(settings_win.show)
@@ -544,7 +553,15 @@ if __name__ == '__main__':
     quit_action.triggered.connect(app.quit)
 
     tray_icon.setContextMenu(tray_menu)
-    tray_icon.setToolTip("Whisper Dictation")
+    tray_icon.setToolTip("OpenWhisper — Ctrl+Win para dictar · doble clic: transcribir archivo · clic derecho: menú")
+
+    def on_tray_activated(reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            show_batch()
+        elif reason == QSystemTrayIcon.ActivationReason.Trigger:
+            tray_menu.popup(QCursor.pos())
+
+    tray_icon.activated.connect(on_tray_activated)
     tray_icon.show()
 
     sys.exit(app.exec())
