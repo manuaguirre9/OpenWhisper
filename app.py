@@ -95,6 +95,10 @@ class Orchestrator(QObject):
         # así las frases en vivo y el texto final salen en orden, y la espera a
         # que el usuario suelte los modificadores no frena el audio.
         self._inject_q = queue.Queue()
+        # Frases en vivo que NO se pudieron tipear porque el usuario seguía con
+        # modificadores apretados. Se pegan junto con el texto final: nunca se
+        # tipea con Ctrl abajo (sale basura y dispara atajos), nunca se pierde.
+        self._deferred = []
 
     # ------------------------------------------------------------ motores --
 
@@ -388,6 +392,9 @@ class Orchestrator(QObject):
             # cerraban; solo falta lo que quedó a medio (Moonshine) o nada
             # (whisper). En modo hold va todo ahora.
             to_inject = pending if self._live_typing else text
+            if self._deferred:
+                to_inject = ("".join(self._deferred) + to_inject).strip()
+                self._deferred = []
             if to_inject:
                 print(f"[Orchestrator] Injecting text: {to_inject}")
                 self._inject_q.put(("paste", to_inject))
@@ -407,14 +414,20 @@ class Orchestrator(QObject):
         while True:
             kind, text = self._inject_q.get()
             try:
-                # Con Ctrl/Win apretados las apps descartan lo inyectado (ver
-                # text_injector.py). En modo hold ya están sueltos; en toggle el
-                # usuario los suelta enseguida después de pulsar.
-                if not wait_modifiers_released(timeout=3.0):
-                    print("[Orchestrator] Modificadores apretados 3s: inyecto igual.")
+                # Con Ctrl/Win apretados las apps descartan lo inyectado y Win+letra
+                # dispara atajos (ver text_injector.py). En modo hold ya están
+                # sueltos; en toggle el usuario los suelta enseguida... salvo que
+                # crea que es modo hold y los mantenga. Entonces NO se tipea: la
+                # frase se guarda y sale con el pegado final.
                 if kind == "type":
-                    type_text(text)
+                    if wait_modifiers_released(timeout=2.0):
+                        type_text(text)
+                    else:
+                        print("[Orchestrator] Modificadores apretados: difiero la frase al final.")
+                        self._deferred.append(text)
                 else:
+                    if not wait_modifiers_released(timeout=15.0):
+                        print("[Orchestrator] Modificadores apretados 15s: pego igual.")
                     paste_text(text)
             except Exception as e:  # noqa: BLE001
                 print(f"[Orchestrator] Error inyectando texto: {e}")

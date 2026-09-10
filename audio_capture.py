@@ -6,6 +6,54 @@ import numpy as np
 import queue
 
 
+class HighPass:
+    """Pasa-altos Butterworth de 4º orden (dos biquads), con estado entre bloques.
+
+    Por qué: MEDIDO en las entradas del usuario (Audient EVO4, "Mic | Line 2"
+    y también la 1/2), hay un zumbido de 50 Hz con armónico en 100 Hz a
+    -23 dBFS, más fuerte que la voz; y Silero lo marca como habla continua.
+    Un 2º orden a 80 Hz lo bajaba solo ~8 dB; el 4º orden a 100 Hz lo baja
+    ~24 dB. Por debajo de 100 Hz de la voz solo queda parte del fundamental
+    grave, que a los modelos de ASR no les hace falta (la telefonía corta
+    en 300 Hz).
+    """
+
+    def __init__(self, cutoff_hz=100.0, sample_rate=16000):
+        import math
+        w0 = 2.0 * math.pi * cutoff_hz / sample_rate
+        cos_w0, sin_w0 = math.cos(w0), math.sin(w0)
+        # Butterworth de 4º orden = dos secciones de 2º orden con Q 0.5412 y 1.3066.
+        self._sections = []
+        for q in (0.54119610, 1.30656296):
+            alpha = sin_w0 / (2.0 * q)
+            a0 = 1.0 + alpha
+            b = np.array([(1.0 + cos_w0) / 2.0, -(1.0 + cos_w0), (1.0 + cos_w0) / 2.0]) / a0
+            a = np.array([-2.0 * cos_w0, 1.0 - alpha]) / a0
+            self._sections.append([b, a, np.zeros(2)])
+
+    def reset(self):
+        for sec in self._sections:
+            sec[2][:] = 0.0
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        """Direct Form II transpuesta, muestra a muestra. Bloques de 100ms
+        (1600 muestras) tardan ~2ms en Python; no vale la pena scipy."""
+        y = np.asarray(x, dtype=np.float64)
+        for sec in self._sections:
+            (b0, b1, b2), (a1, a2), z = sec[0], sec[1], sec[2]
+            z1, z2 = z
+            out = np.empty_like(y)
+            for i in range(len(y)):
+                xi = y[i]
+                yi = b0 * xi + z1
+                z1 = b1 * xi - a1 * yi + z2
+                z2 = b2 * xi - a2 * yi
+                out[i] = yi
+            z[0], z[1] = z1, z2
+            y = out
+        return y.astype(np.float32)
+
+
 class AudioRecorder:
     # Roughly normalizes RMS into [0, 1]. Lower divisor = more sensitive
     # bars: normal speech (RMS ~0.04-0.08) now lands in the 60-100% range
@@ -13,8 +61,10 @@ class AudioRecorder:
     _RMS_NORM = 0.06
     _LEVEL_HISTORY = 64
 
-    def __init__(self, sample_rate=16000):
+    def __init__(self, sample_rate=16000, highpass_hz=100.0):
         self.sample_rate = sample_rate
+        # Ver HighPass. 0/None lo desactiva.
+        self._hp = HighPass(highpass_hz, sample_rate) if highpass_hz else None
         self.q = queue.Queue()
         self.is_recording = False
         self.audio_data = []
@@ -40,6 +90,9 @@ class AudioRecorder:
             return
 
         chunk = indata.copy()
+        if self._hp is not None:
+            flat = self._hp.process(chunk[:, 0].astype(np.float32))
+            chunk = flat.reshape(-1, 1).astype(np.float32)
         self.q.put(chunk)
 
         # Compute RMS for the waveform overlay. Cheap (one mean+sqrt per block).
@@ -70,6 +123,8 @@ class AudioRecorder:
         print(f"[AudioRecorder] Starting recording on device: {device_id}...")
         self.is_recording = True
         self.audio_data = []
+        if self._hp is not None:
+            self._hp.reset()
 
         while not self.q.empty():
             self.q.get()
