@@ -1,5 +1,6 @@
 import queue
 import sys
+import numpy as np
 import threading
 import time
 from pynput import keyboard
@@ -382,10 +383,35 @@ class Orchestrator(QObject):
         self._live = None
         return text, pending
 
+    def _save_take_audio(self, audio_data):
+        """Guarda el audio de la toma (last_take.wav, y el anterior como
+        prev_take.wav) para poder diagnosticar un reconocimiento malo con el
+        audio real, no con suposiciones. 12s de dictado son ~380 KB."""
+        try:
+            import os
+            import wave
+            from config_manager import CONFIG_DIR
+            last = os.path.join(CONFIG_DIR, "last_take.wav")
+            prev = os.path.join(CONFIG_DIR, "prev_take.wav")
+            if os.path.exists(last):
+                os.replace(last, prev)
+            pcm = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16)
+            with wave.open(last, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(16000)
+                w.writeframes(pcm.tobytes())
+            peak = float(np.max(np.abs(audio_data))) if len(audio_data) else 0.0
+            rms = float(np.sqrt(np.mean(audio_data ** 2))) if len(audio_data) else 0.0
+            print(f"[Take] audio: pico {peak:.3f}, RMS {rms:.4f} → {last}")
+        except Exception as e:  # noqa: BLE001 - el diagnóstico nunca rompe la toma
+            print(f"[Take] no pude guardar el audio: {e}")
+
     def _finish_take(self, audio_data, lang):
         try:
             t0 = time.perf_counter()
             print(f"[Take] audio grabado: {len(audio_data) / 16000:.1f}s")
+            self._save_take_audio(audio_data)
             text, pending = self._finalize_live(audio_data, lang)
             print(f"[Take] decodificación final: {time.perf_counter() - t0:.2f}s, {len(text)} chars")
             # En modo toggle las frases ya salieron por on_line a medida que
