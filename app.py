@@ -17,6 +17,7 @@ from audio_ducking import AudioDucker
 from dictation_bubble import DictationBubble
 from batch_window import BatchTranscriptionWindow
 from text_injector import paste_text, type_text, wait_modifiers_released
+import app_log
 
 def create_tray_icon_pixmap():
     """Create a simple dynamic icon for the system tray if no .ico file exists."""
@@ -87,6 +88,8 @@ class Orchestrator(QObject):
         self._live_lines = []     # frases ya cerradas en esta toma (para el widget)
         self._live_partial = ""
         self._live_typing = False  # ¿esta toma escribe en vivo en el destino?
+        self._t_take = self._t_release = 0.0
+        self._t_first_text = None
 
         # Todo lo que se escribe en la app destino pasa por UNA cola y UN hilo:
         # así las frases en vivo y el texto final salen en orden, y la espera a
@@ -223,6 +226,15 @@ class Orchestrator(QObject):
             self._stop_take()
 
     def _start_take(self):
+        self._t_take = time.perf_counter()
+        self._t_first_text = None
+        mic = self.config.get("microphone", "default")
+        try:
+            import sounddevice as sd
+            mic_name = sd.query_devices(None if mic == "default" else mic, "input")["name"]
+        except Exception:
+            mic_name = "?"
+        print(f"[Take] inicio (motor {self.engine_name}, modo {self.config.get('hotkey_mode', 'hold')}, mic {mic} = {mic_name!r})")
         self.is_recording = True
         self._live_typing = self.config.get("hotkey_mode", "hold") == "toggle"
         self._live_lines = []
@@ -240,6 +252,8 @@ class Orchestrator(QObject):
         self._start_live()
 
     def _stop_take(self):
+        self._t_release = time.perf_counter()
+        print(f"[Take] soltar a los {self._t_release - self._t_take:.1f}s")
         self.is_recording = False
         self._finalizing = True
         self.ui_widget.update_ui_signal.emit("processing")
@@ -325,6 +339,7 @@ class Orchestrator(QObject):
 
     def _on_line(self, text):
         """Una frase cerró. Es definitiva: va al widget y, en modo toggle, al destino."""
+        print(f"[Take] frase a los {time.perf_counter() - self._t_take:.1f}s: {text[:80]!r}")
         self._live_lines.append(text)
         self._live_partial = ""
         self._push_live_text()
@@ -333,6 +348,9 @@ class Orchestrator(QObject):
 
     def _push_live_text(self):
         shown = " ".join(self._live_lines + ([self._live_partial] if self._live_partial else []))
+        if shown and self._t_first_text is None:
+            self._t_first_text = time.perf_counter()
+            print(f"[Take] primer texto a los {self._t_first_text - self._t_take:.2f}s: {shown[:60]!r}")
         self.ui_widget.update_text_signal.emit(shown)
 
     def _finalize_live(self, audio_data, lang):
@@ -362,7 +380,10 @@ class Orchestrator(QObject):
 
     def _finish_take(self, audio_data, lang):
         try:
+            t0 = time.perf_counter()
+            print(f"[Take] audio grabado: {len(audio_data) / 16000:.1f}s")
             text, pending = self._finalize_live(audio_data, lang)
+            print(f"[Take] decodificación final: {time.perf_counter() - t0:.2f}s, {len(text)} chars")
             # En modo toggle las frases ya salieron por on_line a medida que
             # cerraban; solo falta lo que quedó a medio (Moonshine) o nada
             # (whisper). En modo hold va todo ahora.
@@ -370,7 +391,9 @@ class Orchestrator(QObject):
             if to_inject:
                 print(f"[Orchestrator] Injecting text: {to_inject}")
                 self._inject_q.put(("paste", to_inject))
+            t1 = time.perf_counter()
             self._inject_q.join()
+            print(f"[Take] escritura: {time.perf_counter() - t1:.2f}s · espera total desde soltar: {time.perf_counter() - self._t_release:.2f}s")
         except Exception as e:
             print(f"[Orchestrator] Error during transcription/injection: {e}")
         finally:
@@ -439,6 +462,7 @@ class Orchestrator(QObject):
             listener.join()
 
 if __name__ == '__main__':
+    app_log.install()
     # Ensure PyQt doesn't quit if settings window closes
     QApplication.setQuitOnLastWindowClosed(False)
     app = QApplication(sys.argv)
