@@ -14,7 +14,6 @@ from transcription_engine import Transcriber
 from config_manager import load_config
 from settings_ui import SettingsWindow
 from audio_ducking import AudioDucker
-from floating_widget import FloatingWidget
 from dictation_bubble import DictationBubble
 from batch_window import BatchTranscriptionWindow
 from text_injector import paste_text, type_text, wait_modifiers_released
@@ -431,6 +430,7 @@ class Orchestrator(QObject):
 
     def run(self):
         threading.Thread(target=self._injector_loop, daemon=True).start()
+        self.ui_widget.update_ui_signal.emit("loading")
         self.load_model()
         self.start_keep_alive()
         mode = self.config.get("hotkey_mode", "hold")
@@ -443,22 +443,13 @@ if __name__ == '__main__':
     QApplication.setQuitOnLastWindowClosed(False)
     app = QApplication(sys.argv)
 
-    # UI
-    ui = FloatingWidget()
-    ui.show()
-
-    # Globo de dictado: aparece abajo al centro cuando empieza la toma, muestra
-    # el texto a medida que se reconoce y desaparece cuando termina. Escucha
-    # las mismas señales que la píldora.
-    bubble = DictationBubble()
-    ui.update_ui_signal.connect(bubble.handle_state_change)
-    ui.update_text_signal.connect(bubble.set_text)
+    # UI: el globo de dictado es la única ventana. Aparece abajo al centro
+    # mientras carga la IA y durante cada toma, y desaparece el resto del
+    # tiempo. Lo demás vive en el ícono de la bandeja.
+    ui = DictationBubble()
 
     # Orchestrator
     orchestrator = Orchestrator(ui)
-    # Wire the recorder into the widget so it can poll live RMS levels
-    # for the waveform visualization while recording.
-    ui.set_recorder(orchestrator.recorder)
     bg_thread = threading.Thread(target=orchestrator.run, daemon=True)
     bg_thread.start()
 

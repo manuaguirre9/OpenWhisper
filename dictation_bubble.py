@@ -4,28 +4,37 @@ toma, muestra el texto a medida que se va reconociendo, y desaparece cuando
 la toma termina. Es solo lectura: no acepta foco ni clics, para que el texto
 que la app escribe siga yendo a la ventana que el usuario tenía activa.
 
-Se maneja con las mismas señales que la píldora (ver app.py):
-    update_ui_signal("recording")  → aparece
-    update_ui_signal("processing") → sigue visible, con puntos animados
-    update_ui_signal("ready")      → desaparece
-    update_text_signal(texto)      → reemplaza el texto que muestra
+Es la única UI de la app (además del ícono de la bandeja). El orquestador le
+habla por señales, desde sus hilos:
+    update_ui_signal("loading")          → aparece con "Cargando IA…"
+    update_loading_progress_signal(pct)  → porcentaje de descarga del modelo
+    update_ui_signal("ready")            → desaparece
+    update_ui_signal("recording")        → aparece, vacío, punto rojo
+    update_text_signal(texto)            → reemplaza el texto que muestra
+    update_ui_signal("processing")       → sigue visible, con puntos animados
 """
 import math
 
 from PyQt6.QtWidgets import QApplication, QWidget
 from PyQt6.QtCore import (
     Qt, QTimer, QRect, QRectF, QPointF, QPoint, QPropertyAnimation,
-    QParallelAnimationGroup, QEasingCurve, QSize,
+    QParallelAnimationGroup, QEasingCurve, QSize, pyqtSignal,
 )
 from PyQt6.QtGui import QFont, QFontMetrics, QPainter, QColor
 
-from floating_widget import (
-    WF_SURFACE, WF_ON_SURFACE, WF_ON_SURFACE_MUTED,
-    WF_ACCENT_RECORDING, WF_ACCENT_PROCESSING,
-)
+# Paleta compartida con batch_window.py: negro mate, sin borde ni sombra.
+WF_SURFACE = QColor(14, 14, 18, 255)
+WF_ON_SURFACE = QColor(232, 232, 240, 235)
+WF_ON_SURFACE_MUTED = QColor(170, 170, 182, 200)
+WF_ACCENT_RECORDING = QColor(255, 112, 122)   # coral
+WF_ACCENT_PROCESSING = QColor(180, 160, 255)  # lavanda
 
 
 class DictationBubble(QWidget):
+    update_ui_signal = pyqtSignal(str)
+    update_loading_progress_signal = pyqtSignal(int)
+    update_text_signal = pyqtSignal(str)
+
     MAX_W = 620          # ancho máximo del globo
     MIN_W = 260
     PAD_X = 22
@@ -36,6 +45,7 @@ class DictationBubble(QWidget):
     MAX_CHARS = 320      # más que esto se muestra solo la cola, con "…" adelante
     FONT = ("Segoe UI", 13)
     PLACEHOLDER = "Escuchando…"
+    LOADING_TEXT = "Cargando IA…"
     ANIM_MS = 170
     SLIDE_PX = 12
 
@@ -63,12 +73,25 @@ class DictationBubble(QWidget):
         self._timer.timeout.connect(self._tick)
 
         self._anim = None
+        self._loading_percent = None
         self._layout_text()
+
+        self.update_ui_signal.connect(self.handle_state_change)
+        self.update_loading_progress_signal.connect(self._handle_loading_progress)
+        self.update_text_signal.connect(self.set_text)
 
     # ------------------------------------------------------------ señales --
 
     def handle_state_change(self, state):
-        if state == "recording":
+        if state == "loading":
+            self._text = ""
+            self._loading_percent = None
+            self.state = "loading"
+            self._layout_text()
+            if not self.isVisible():
+                self._appear()
+            self.update()
+        elif state == "recording":
             self._text = ""
             self.state = "recording"
             self._layout_text()
@@ -81,6 +104,21 @@ class DictationBubble(QWidget):
         else:  # ready, loading
             if self.state != "hidden":
                 self._vanish()
+
+    def _handle_loading_progress(self, percent):
+        try:
+            self._loading_percent = max(0, min(100, int(percent)))
+        except (TypeError, ValueError):
+            return
+        if self.state == "loading":
+            self.update()
+
+    def _placeholder(self) -> str:
+        if self.state == "loading":
+            if self._loading_percent is None:
+                return self.LOADING_TEXT
+            return f"{self.LOADING_TEXT} {self._loading_percent}%"
+        return self.PLACEHOLDER
 
     def set_text(self, text):
         text = (text or "").strip()
@@ -106,7 +144,7 @@ class DictationBubble(QWidget):
     def _layout_text(self):
         """Recalcula el tamaño para el texto actual y recentra abajo."""
         fm = QFontMetrics(self._font)
-        text = self._text or self.PLACEHOLDER
+        text = self._text or self._placeholder()
         text_max_w = self.MAX_W - 2 * self.PAD_X - self.INDICATOR_W
         bound = fm.boundingRect(QRect(0, 0, text_max_w, 10_000),
                                 int(Qt.TextFlag.TextWordWrap), text)
@@ -223,5 +261,5 @@ class DictationBubble(QWidget):
             painter.setPen(WF_ON_SURFACE_MUTED)
             painter.drawText(self._text_rect,
                              int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-                             self.PLACEHOLDER)
+                             self._placeholder())
         painter.end()

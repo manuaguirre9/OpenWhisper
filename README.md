@@ -7,7 +7,7 @@ OpenWhisper is a privacy-first, local-only push-to-talk dictation tool for Windo
 - **System-Wide Push-To-Talk:** Just hold `Ctrl + Windows`, speak, and release. The text is instantly injected into whatever application you are using.
 - **Hardware Acceleration:** Automatically uses NVIDIA/AMD GPUs if available, falling back to highly optimized CPU execution.
 - **Audio Ducking:** Automatically lowers background music/volume while you are recording so the AI can hear you clearly.
-- **Unobtrusive UI:** A transparent, click-through, draggable widget shows you the current state (Ready, Recording, Processing).
+- **Unobtrusive UI:** A click-through bubble at the bottom center of the screen appears only while the model loads and while you dictate, showing the recognized text live. Everything else lives in the tray icon.
 - **Keep-Alive:** The AI model is kept "warm" in RAM so it responds instantly even after hours of inactivity.
 
 ## Installation (From Source)
