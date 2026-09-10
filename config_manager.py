@@ -21,7 +21,17 @@ DEFAULT_CONFIG = {
     "beam_size": 1,
     # "segment" = decodificar cada frase mientras hablás (la espera al soltar es
     # solo la última frase). "oneshot" = todo al final, el camino viejo.
-    "dictation_mode": "segment"
+    # Solo aplica al motor whisper.
+    "dictation_mode": "segment",
+    # "moonshine" = streaming nativo, texto en vivo mientras hablás (modelos en
+    # español bajo licencia no comercial). "whisper" = faster-whisper (MIT).
+    "engine": "moonshine",
+    # "hold" = dictás mientras mantenés Ctrl+Win; el texto se ve en vivo en el
+    # widget y se pega al soltar. "toggle" = una pulsación empieza, otra termina;
+    # cada frase se ESCRIBE en la app destino apenas cierra. El modo hold no
+    # puede escribir en vivo: con Ctrl apretado las apps descartan las letras
+    # inyectadas (ver text_injector.py).
+    "hotkey_mode": "hold",
 }
 
 def load_config():

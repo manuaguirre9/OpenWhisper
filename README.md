@@ -144,6 +144,40 @@ frase menos lo que se alcanzó a solapar. Con `small` en esta Pi eso son ~2,6s
 para una frase de 5s, y ningún cambio de arquitectura lo baja — para eso hace
 falta un modelo más rápido.
 
+## Texto en vivo: Moonshine y los dos modos del hotkey
+
+Whisper no puede mostrar texto mientras hablás en una CPU normal (arriba está
+la medición). [Moonshine v2](https://github.com/moonshine-ai/moonshine) sí: es
+un modelo pensado para streaming, procesa el audio una sola vez y emite
+parciales cada ~0,5s. `moonshine_engine.py` lo envuelve con la misma interfaz
+que `SegmentASR`; la app elige con `config["engine"]`.
+
+MEDIDO en este Ryzen (`spike_moonshine.py`, clips del banco a tiempo real):
+
+| motor | clip | espera al soltar | primer texto visible | WER |
+|---|---|---|---|---|
+| Moonshine small (es) | es-AR 47s | **0,05s** | 1,7s | 0,9% (una tilde) |
+| Whisper small, segmentos | es-AR 47s | 0,56s | 6,4s (primera frase cerrada) | 0,0% |
+
+Moonshine casi no pone puntuación en español; Whisper sí. Los modelos de
+Moonshine que no son inglés están bajo la *Moonshine Community License* (no
+comercial por encima de 1M USD anuales); el código es MIT.
+
+**Escribir en la app destino mientras hablás tiene una condición física**,
+medida en Chromium (WhatsApp, Claude, ChatGPT, VS Code): con Ctrl apretado,
+toda letra inyectada se interpreta como atajo y se descarta. Con Win apretado,
+un Ctrl+V es Win+Ctrl+V. Por eso hay dos modos (`config["hotkey_mode"]`,
+también en Configuración):
+
+| modo | cómo se usa | qué ves mientras hablás | cuándo se escribe en el destino |
+|---|---|---|---|
+| `hold` (default) | mantenés Ctrl+Win | el texto en vivo en el widget flotante | todo al soltar (~0,1s con Moonshine) |
+| `toggle` | pulsás Ctrl+Win para empezar y otra vez para terminar | lo mismo | **cada frase apenas cierra**, mientras seguís hablando |
+
+En los dos modos los parciales (que Moonshine reescribe) solo se muestran; al
+destino van únicamente frases cerradas, que son definitivas. `text_injector.py`
+espera a que no haya modificadores apretados antes de escribir.
+
 ## Building the Executable (.exe)
 If you want to create a standalone executable that runs without installing Python:
 1. Ensure `pyinstaller` is installed: `pip install pyinstaller`.

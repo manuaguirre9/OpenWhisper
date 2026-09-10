@@ -58,6 +58,38 @@ class SettingsWindow(QWidget):
             self.model_combo.setCurrentText(current_model)
         layout.addLayout(self._labeled_row("Modelo de IA", self.model_combo))
 
+        # --- Motor ---
+        # Moonshine es streaming nativo: muestra texto mientras hablás y la
+        # espera al terminar es ~0,1s. Whisper es el camino MIT, sin texto en
+        # vivo (cada frase se decodifica cuando cierra).
+        self.engine_combo = QComboBox()
+        self.engines = {
+            "moonshine": "Moonshine (texto en vivo)",
+            "whisper": "Whisper (faster-whisper)",
+        }
+        for code, name in self.engines.items():
+            self.engine_combo.addItem(name, userData=code)
+        idx = self.engine_combo.findData(self.config.get("engine", "moonshine"))
+        if idx >= 0:
+            self.engine_combo.setCurrentIndex(idx)
+        layout.addLayout(self._labeled_row("Motor", self.engine_combo))
+
+        # --- Modo del hotkey ---
+        # Escribir en la app destino MIENTRAS dictás solo es posible si no hay
+        # modificadores apretados (Chromium descarta letras con Ctrl abajo), por
+        # eso el modo "mantener" muestra el texto en el widget y pega al soltar.
+        self.hotkey_mode_combo = QComboBox()
+        self.hotkey_modes = {
+            "hold": "Mantener apretado (pega al soltar)",
+            "toggle": "Alternar: pulsar para empezar y terminar (escribe en vivo)",
+        }
+        for code, name in self.hotkey_modes.items():
+            self.hotkey_mode_combo.addItem(name, userData=code)
+        idx = self.hotkey_mode_combo.findData(self.config.get("hotkey_mode", "hold"))
+        if idx >= 0:
+            self.hotkey_mode_combo.setCurrentIndex(idx)
+        layout.addLayout(self._labeled_row("Hotkey Ctrl+Win", self.hotkey_mode_combo))
+
         # --- Ducking ---
         self.duck_combo = QComboBox()
         for i in range(0, 101, 10):
@@ -119,7 +151,7 @@ class SettingsWindow(QWidget):
 
         layout.addStretch()
 
-        note = QLabel("Cambiar el modelo o los hilos recarga la IA.")
+        note = QLabel("Cambiar el motor, el modelo, el idioma o los hilos recarga la IA.")
         note.setObjectName("subtle")
         layout.addWidget(note)
 
@@ -185,6 +217,8 @@ class SettingsWindow(QWidget):
         self.config["microphone"] = self.mic_combo.currentData()
         self.config["language"] = self.lang_combo.currentData()
         self.config["model_size"] = self.model_combo.currentText()
+        self.config["engine"] = self.engine_combo.currentData()
+        self.config["hotkey_mode"] = self.hotkey_mode_combo.currentData()
         self.config["ducking_percentage"] = self.duck_combo.currentData()
         self.config["cpu_threads"] = self.threads_spin.value()
         self.config["custom_vocabulary"] = self.vocab_edit.toPlainText().strip()
