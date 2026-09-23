@@ -229,6 +229,16 @@ class Orchestrator(QObject):
         es justo lo que el usuario tipeó en el globo."""
         return corrections.vocabulary_string(self.config.get("custom_vocabulary", ""))
 
+    def _rebuild_speller(self):
+        """Rehacer el corrector cuando cambia el idioma. Corre en el hilo de
+        Qt (viene de settings_saved), que es donde vive su objeto COM."""
+        try:
+            self.speller = SystemSpellChecker(self.config.get("language", "es"))
+            self.ui_widget.set_spellchecker(self.speller)
+            self._teach_speller()
+        except Exception as exc:  # noqa: BLE001 - sin corrector se dicta igual
+            print(f"[Ortografia] No pude rehacer el corrector: {exc}")
+
     def _teach_speller(self, vocab=None):
         """Que el corrector deje de marcar lo que el usuario ya declaró suyo:
         si no, `nitoOS` y `ReSpeaker` quedarían subrayados para siempre."""
@@ -291,9 +301,18 @@ class Orchestrator(QObject):
         return self.transcriber is not None
 
     def apply_new_config(self, new_config):
+        """Aplicar la config que guardó la ventana de Configuración.
+
+        La COPIA es obligatoria, no una precaución: SettingsWindow muta su
+        propio dict y emite ESE objeto. Si lo guardáramos por referencia, en el
+        guardado siguiente `old` y `new_config` serían el mismo dict, toda
+        comparación daría igual y `needs_reload` quedaría en False para
+        siempre: cambiar de motor o de modelo no haría nada hasta reiniciar.
+        """
         print("[Orchestrator] Applying new config...")
         old = self.config
-        self.config = new_config
+        self.config = dict(new_config)
+        new_config = self.config
 
         needs_reload = (
             new_config.get("engine", "moonshine") != old.get("engine", "moonshine") or
@@ -308,6 +327,8 @@ class Orchestrator(QObject):
             threading.Thread(target=self.load_model, daemon=True).start()
             return
         # Vocabulary and beam_size can be updated live without reloading.
+        if new_config.get("language") != old.get("language"):
+            self._rebuild_speller()
         vocab = corrections.vocabulary_string(new_config.get("custom_vocabulary", ""))
         self._teach_speller(vocab)
         if self.transcriber is not None:
@@ -529,6 +550,7 @@ class Orchestrator(QObject):
         No toca el globo a propósito: ahí ya está el texto de Moonshine, y
         mezclar los dos mostraría la misma frase dos veces, segmentada distinto.
         """
+        text = corrections.apply(text)   # ver _on_line: en toggle esto ya se escribe
         print(f"[Take] whisper cerró a los {time.perf_counter() - self._t_take:.1f}s: {text[:80]!r}")
         if self._live_typing:
             self._inject_q.put(("type", text + " "))
@@ -539,7 +561,12 @@ class Orchestrator(QObject):
         self._push_live_text()
 
     def _on_line(self, text):
-        """Una frase cerró. Es definitiva: va al widget y, en modo toggle, al destino."""
+        """Una frase cerró. Es definitiva: va al widget y, en modo toggle, al destino.
+
+        Se corrige ACÁ y no solo en _finish_take porque en modo toggle esta
+        frase se escribe ya mismo en la aplicación destino: si el vocabulario
+        aprendido se aplicara únicamente al final, toggle nunca lo vería."""
+        text = corrections.apply(text)
         print(f"[Take] frase a los {time.perf_counter() - self._t_take:.1f}s: {text[:80]!r}")
         self._live_lines.append(text)
         self._live_partial = ""
@@ -620,14 +647,19 @@ class Orchestrator(QObject):
             # más probable, esto lo garantiza.
             to_inject = corrections.apply(to_inject)
             text = corrections.apply(text)
+            t1 = time.perf_counter()
+            # Vaciar la cola ANTES de leer _deferred: el injector difiere las
+            # frases que caen con modificadores apretados, y si lo leyéramos
+            # primero, las que difiera mientras drena quedarían fuera de esta
+            # toma y aparecerían fuera de orden al principio de la siguiente.
+            self._inject_q.join()
             if self._deferred:
                 to_inject = ("".join(self._deferred) + to_inject).strip()
                 self._deferred = []
             if to_inject:
                 print(f"[Orchestrator] Injecting text: {to_inject}")
                 self._inject_q.put(("paste", to_inject))
-            t1 = time.perf_counter()
-            self._inject_q.join()
+                self._inject_q.join()
             print(f"[Take] escritura: {time.perf_counter() - t1:.2f}s · espera total desde soltar: {time.perf_counter() - self._t_release:.2f}s")
         except Exception as e:
             print(f"[Orchestrator] Error during transcription/injection: {e}")

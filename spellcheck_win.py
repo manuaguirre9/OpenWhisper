@@ -139,6 +139,13 @@ class SystemSpellChecker:
         """El idioma de la app es 'es'; Windows quiere una variante. Se prueba
         la rioplatense primero, después la genérica."""
         base = (language or "es").lower().split("-")[0]
+        # "auto" es una opción válida del idioma de la app (Nemotron detecta
+        # solo), pero un corrector ortográfico necesita un idioma concreto.
+        # Sin esto se probaría "auto-AR"/"auto", ninguno existiría y el marcado
+        # quedaría apagado en silencio. Se usa el mismo default que el resto
+        # de la app (ver moonshine_engine.resolve_language).
+        if base in ("auto", "") or len(base) != 2:
+            base = "es"
         for tag in (f"{base}-AR", f"{base}-419", f"{base}-ES", base):
             try:
                 if factory.IsSupported(tag):

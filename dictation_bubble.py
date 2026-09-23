@@ -144,6 +144,10 @@ class DictationBubble(QWidget):
 
     def handle_state_change(self, state):
         if state == "loading":
+            # Sin esto el globo se queda con el mouse habilitado y el temporizador
+            # vivo durante toda la carga del modelo: opaco, quieto y comiéndose
+            # cada clic abajo al centro de la pantalla.
+            self._end_correctable()
             self._text = ""
             self._loading_percent = None
             self.state = "loading"
