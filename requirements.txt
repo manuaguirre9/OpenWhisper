@@ -7,5 +7,5 @@ pyperclip
 pyautogui
 pycaw
 comtypes
-sherpa-onnx
+sherpa-onnx>=1.13.4   # 1.13.4+ trae el Nemotron 3.5 multilingue (nemotron_engine.py)
 moonshine-voice

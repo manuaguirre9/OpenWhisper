@@ -49,8 +49,8 @@ PyYAML==6.0.3
 rich==15.0.0
 setuptools==82.0.1
 shellingham==1.5.4
-sherpa-onnx-core==1.13.2
-sherpa_onnx==1.13.2
+sherpa-onnx-core==1.13.8
+sherpa_onnx==1.13.8
 six==1.17.0
 sounddevice==0.5.5
 tokenizers==0.23.1

@@ -11,6 +11,8 @@ from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QCursor
 
 from audio_capture import AudioRecorder
 from segment_asr import SegmentASR
+import corrections
+from spellcheck_win import SystemSpellChecker
 from transcription_engine import Transcriber
 from config_manager import load_config
 from settings_ui import SettingsWindow
@@ -55,6 +57,76 @@ class _SegmentLive:
         return ""
 
 
+class _HybridLive:
+    """Moonshine para MOSTRAR, Whisper para ESCRIBIR, sobre el mismo audio.
+
+    POR QUÉ: Moonshine es el único que muestra texto mientras hablás en esta
+    CPU, pero es el menos exacto de los dos (MEDIDO en openwhisper.log: inventa
+    `superiferia`, `varija`, `barch`). Whisper acierta más pero no puede
+    mostrar nada en vivo. Acá cada uno hace lo que sabe: el globo se llena con
+    Moonshine a los ~1,2s, y lo que termina escrito en tu aplicación es de
+    Whisper.
+
+    POR QUÉ WHISPER VA EN SU PROPIO HILO: `SegmentASR.poll()` BLOQUEA mientras
+    decodifica un segmento (medido en la Pi: segundos). Si se lo llamara desde
+    el hilo que alimenta a Moonshine, cada segmento de Whisper congelaría el
+    texto en vivo justo lo que tarda en decodificar, que es exactamente lo que
+    el híbrido viene a evitar. Así que el audio se le pasa por una cola y él
+    decodifica a su ritmo, sin frenar a nadie.
+
+    La espera al soltar NO vuelve a ser la del Whisper de antes: mientras
+    hablabas ya decodificó todo lo que cerró por VAD, y al final solo le queda
+    la cola.
+    """
+
+    def __init__(self, moonshine_session, segmenter: SegmentASR):
+        self.ms = moonshine_session
+        self.seg = segmenter
+        self._q = queue.Queue()
+        self._stop = threading.Event()
+        self._worker = threading.Thread(target=self._run, daemon=True)
+        self._worker.start()
+
+    def _run(self):
+        while True:
+            try:
+                chunk = self._q.get(timeout=0.1)
+            except queue.Empty:
+                if self._stop.is_set():
+                    return
+                continue
+            try:
+                self.seg.insert_audio(chunk)
+                self.seg.poll()
+            except Exception as e:  # noqa: BLE001 - nunca matar el hilo
+                print(f"[Hibrido] Whisper: {e}")
+            finally:
+                self._q.task_done()
+
+    def insert_audio(self, chunk):
+        # Moonshine primero y en este hilo: es incremental y barato, y es el
+        # que le da la cara al usuario.
+        self.ms.insert_audio(chunk)
+        self._q.put(np.asarray(chunk, dtype=np.float32).copy())
+
+    def poll(self):
+        pass        # lo hace el worker
+
+    def finish(self) -> str:
+        """Devuelve el texto de WHISPER: es el que se escribe."""
+        try:
+            self.ms.finish()        # cierra el stream de Moonshine (ya no se usa)
+        except Exception as e:  # noqa: BLE001
+            print(f"[Hibrido] Moonshine al cerrar: {e}")
+        self._q.join()              # que termine de tragar lo encolado
+        self._stop.set()
+        self._worker.join(timeout=30.0)
+        return self.seg.finish()
+
+    def pending_text(self) -> str:
+        return ""   # SegmentASR entrega todo por on_commit, igual que _SegmentLive
+
+
 # --- Background Orchestrator ---
 class Orchestrator(QObject):
     def __init__(self, ui_widget):
@@ -77,6 +149,10 @@ class Orchestrator(QObject):
         # batch carga el suyo cuando lo necesita.
         self.transcriber = None
         self.moonshine = None
+        self.nemotron = None
+        # Corrector del sistema: lo crea main() en el hilo de Qt (es COM) y
+        # nos lo pasa para poder ignorar el vocabulario propio del usuario.
+        self.speller = None
         self.engine_name = None
         self.audio_ducker = AudioDucker()
 
@@ -111,7 +187,31 @@ class Orchestrator(QObject):
 
     def load_model(self):
         engine = self.config.get("engine", "moonshine")
-        if engine == "moonshine":
+        if engine == "nemotron":
+            try:
+                self._load_nemotron()
+                self.ui_widget.update_ui_signal.emit("ready")
+                return
+            except Exception as e:  # noqa: BLE001 - sin Nemotron, Moonshine sirve
+                print(f"[Orchestrator] Nemotron no cargo ({e}); uso Moonshine.")
+                engine = "moonshine"
+        if engine == "hibrido":
+            # El híbrido necesita LOS DOS. Si Moonshine no carga se degrada a
+            # whisper solo (se pierde el vivo, no la exactitud); si el que no
+            # carga es Whisper, queda Moonshine solo.
+            try:
+                self._load_moonshine()
+            except Exception as e:  # noqa: BLE001
+                print(f"[Orchestrator] Moonshine no cargó ({e}); híbrido → whisper.")
+                engine = "whisper"
+            else:
+                try:
+                    self._load_whisper(keep_moonshine=True)
+                    self.engine_name = "hibrido"
+                except Exception as e:  # noqa: BLE001
+                    print(f"[Orchestrator] Whisper no cargó ({e}); híbrido → moonshine.")
+                    self.engine_name = "moonshine"
+        elif engine == "moonshine":
             try:
                 self._load_moonshine()
             except Exception as e:  # noqa: BLE001 - sin Moonshine, Whisper sigue sirviendo
@@ -121,6 +221,37 @@ class Orchestrator(QObject):
             self._load_whisper()
         self.ui_widget.update_ui_signal.emit("ready")
 
+    def _vocabulary(self) -> str:
+        """Lo que escribiste en Configuración más lo que fuiste corrigiendo.
+
+        Las correcciones entran como keyterms con su grafía exacta: los docs de
+        Moonshine piden escribir el término tal como querés verlo salir, y eso
+        es justo lo que el usuario tipeó en el globo."""
+        return corrections.vocabulary_string(self.config.get("custom_vocabulary", ""))
+
+    def _teach_speller(self, vocab=None):
+        """Que el corrector deje de marcar lo que el usuario ya declaró suyo:
+        si no, `nitoOS` y `ReSpeaker` quedarían subrayados para siempre."""
+        if self.speller is None:
+            return
+        terms = corrections._split(vocab if vocab is not None else self._vocabulary())
+        self.speller.ignore_all(terms)
+
+    def _load_nemotron(self):
+        """Nemotron 3.5 streaming: el unico que muestra en vivo Y puntua.
+        Ver nemotron_engine.py para los numeros que lo justifican."""
+        from nemotron_engine import NemotronEngine
+        from system_info import resolve_cpu_threads
+
+        self.nemotron = NemotronEngine(
+            num_threads=resolve_cpu_threads(self.config.get("cpu_threads", 0)),
+            progress_cb=self._on_download_progress,
+        )
+        self.nemotron.set_vocabulary(self._vocabulary())
+        self.transcriber = None
+        self.moonshine = None
+        self.engine_name = "nemotron"
+
     def _load_moonshine(self):
         from moonshine_engine import MoonshineEngine
 
@@ -128,26 +259,33 @@ class Orchestrator(QObject):
         self.moonshine = MoonshineEngine(
             language=lang,
             model_size=self.config.get("model_size", "small"),
-            vocabulary=self.config.get("custom_vocabulary", ""),
+            vocabulary=self._vocabulary(),
             progress_cb=self._on_download_progress,
         )
         self.transcriber = None
+        self.nemotron = None
         self.engine_name = "moonshine"
 
-    def _load_whisper(self):
+    def _load_whisper(self, keep_moonshine=False):
         self.transcriber = Transcriber(
             model_size=self.config.get("model_size", "small"),
             cpu_threads=self.config.get("cpu_threads", 0),
-            vocabulary=self.config.get("custom_vocabulary", ""),
+            vocabulary=self._vocabulary(),
             beam_size=self.config.get("beam_size", 1),
             progress_cb=self._on_download_progress,
         )
-        self.moonshine = None
-        self.engine_name = "whisper"
+        self.nemotron = None
+        if not keep_moonshine:
+            self.moonshine = None
+            self.engine_name = "whisper"
 
     def _engine_ready(self) -> bool:
         if self._finalizing:
             return False
+        if self.engine_name == "nemotron":
+            return self.nemotron is not None
+        if self.engine_name == "hibrido":
+            return self.moonshine is not None and self.transcriber is not None
         if self.engine_name == "moonshine":
             return self.moonshine is not None
         return self.transcriber is not None
@@ -161,7 +299,7 @@ class Orchestrator(QObject):
             new_config.get("engine", "moonshine") != old.get("engine", "moonshine") or
             new_config.get("model_size") != old.get("model_size") or
             new_config.get("cpu_threads", 0) != old.get("cpu_threads", 0) or
-            (self.engine_name == "moonshine" and
+            (self.engine_name in ("moonshine", "hibrido") and
              new_config.get("language") != old.get("language"))
         )
 
@@ -170,12 +308,29 @@ class Orchestrator(QObject):
             threading.Thread(target=self.load_model, daemon=True).start()
             return
         # Vocabulary and beam_size can be updated live without reloading.
-        vocab = new_config.get("custom_vocabulary", "")
+        vocab = corrections.vocabulary_string(new_config.get("custom_vocabulary", ""))
+        self._teach_speller(vocab)
         if self.transcriber is not None:
             self.transcriber.set_vocabulary(vocab)
             self.transcriber.beam_size = new_config.get("beam_size", 1)
         if self.moonshine is not None:
             self.moonshine.set_vocabulary(vocab)
+        if self.nemotron is not None:
+            self.nemotron.set_vocabulary(vocab)
+
+    def on_correction(self, wrong: str, right: str):
+        """El usuario corrigió una palabra en el globo. Llega del hilo de Qt."""
+        corrections.add(wrong, right)
+        vocab = self._vocabulary()
+        self._teach_speller(vocab)
+        # En caliente: cambiar el sesgo no recarga el modelo, así que la
+        # palabra ya vale para la toma siguiente.
+        if self.transcriber is not None:
+            self.transcriber.set_vocabulary(vocab)
+        if self.moonshine is not None:
+            self.moonshine.set_vocabulary(vocab)
+        if self.nemotron is not None:
+            self.nemotron.set_vocabulary(vocab)
 
     # ------------------------------------------------------------- hotkey --
 
@@ -291,7 +446,28 @@ class Orchestrator(QObject):
         sale por on_commit (→ on_line). Whisper one-shot: nada en vivo.
         """
         self._live = None
-        if self.engine_name == "moonshine" and self.moonshine is not None:
+        if self.engine_name == "nemotron" and self.nemotron is not None:
+            # Un solo stream por toma: los parciales van al globo y el texto
+            # entero sale en finish(). `on_line` no dispara nunca (cortar por
+            # frases le arruina la puntuacion, ver nemotron_engine.py).
+            self._live = self.nemotron.start_session(
+                on_partial=self._on_partial,
+                on_error=lambda e: print(f"[Orchestrator] Nemotron: {e}"),
+            )
+            period = 0.1
+        elif self.engine_name == "hibrido" and self.moonshine is not None                 and self.transcriber is not None:
+            # Moonshine solo MUESTRA (por eso on_line no escribe nada), Whisper
+            # solo ESCRIBE (por eso su on_commit no toca el globo). Al soltar,
+            # el globo pasa a mostrar el texto de Whisper, que es el que se
+            # inyectó: ver el `finally` de _finish_take.
+            session = self.moonshine.start_session(
+                on_partial=self._on_partial,
+                on_line=self._on_line_display,
+                on_error=lambda e: print(f"[Hibrido] Moonshine: {e}"),
+            )
+            self._live = _HybridLive(session, self._new_segmenter(self._on_line_type))
+            period = 0.1
+        elif self.engine_name == "moonshine" and self.moonshine is not None:
             self._live = self.moonshine.start_session(
                 on_partial=self._on_partial,
                 on_line=self._on_line,
@@ -301,18 +477,7 @@ class Orchestrator(QObject):
         elif (self.engine_name == "whisper" and self.transcriber is not None
               and getattr(self.transcriber, "model", None) is not None
               and self.config.get("dictation_mode", "segment") == "segment"):
-            lang = self._language()
-            try:
-                prompt = self.transcriber._build_prompt(lang)
-            except Exception:
-                prompt = None
-            self._live = _SegmentLive(SegmentASR(
-                self.transcriber.model, lang,
-                beam_size=self.transcriber.beam_size,
-                base_prompt=prompt,
-                on_error=lambda e: print(f"[Orchestrator] Segmento falló: {e}"),
-                on_commit=self._on_line,
-            ))
+            self._live = _SegmentLive(self._new_segmenter(self._on_line))
             period = 0.25
         else:
             return
@@ -336,6 +501,37 @@ class Orchestrator(QObject):
 
         self._live_thread = threading.Thread(target=loop, daemon=True)
         self._live_thread.start()
+
+    def _new_segmenter(self, on_commit) -> SegmentASR:
+        """SegmentASR listo para esta toma, con el idioma y prompt de la config."""
+        lang = self._language()
+        try:
+            prompt = self.transcriber._build_prompt(lang)
+        except Exception:
+            prompt = None
+        return SegmentASR(
+            self.transcriber.model, lang,
+            beam_size=self.transcriber.beam_size,
+            base_prompt=prompt,
+            on_error=lambda e: print(f"[Orchestrator] Segmento falló: {e}"),
+            on_commit=on_commit,
+        )
+
+    def _on_line_display(self, text):
+        """Frase cerrada que solo se MUESTRA (híbrido: viene de Moonshine)."""
+        self._live_lines.append(text)
+        self._live_partial = ""
+        self._push_live_text()
+
+    def _on_line_type(self, text):
+        """Frase cerrada que solo se ESCRIBE (híbrido: viene de Whisper).
+
+        No toca el globo a propósito: ahí ya está el texto de Moonshine, y
+        mezclar los dos mostraría la misma frase dos veces, segmentada distinto.
+        """
+        print(f"[Take] whisper cerró a los {time.perf_counter() - self._t_take:.1f}s: {text[:80]!r}")
+        if self._live_typing:
+            self._inject_q.put(("type", text + " "))
 
     def _on_partial(self, text):
         """Parcial de la frase en curso. Solo se MUESTRA: Moonshine lo reescribe."""
@@ -408,6 +604,7 @@ class Orchestrator(QObject):
             print(f"[Take] no pude guardar el audio: {e}")
 
     def _finish_take(self, audio_data, lang):
+        text = ""   # lo lee el `finally` para dejar el globo corregible
         try:
             t0 = time.perf_counter()
             print(f"[Take] audio grabado: {len(audio_data) / 16000:.1f}s")
@@ -418,6 +615,11 @@ class Orchestrator(QObject):
             # cerraban; solo falta lo que quedó a medio (Moonshine) o nada
             # (whisper). En modo hold va todo ahora.
             to_inject = pending if self._live_typing else text
+            # Aunque el modelo vuelva a errarle a una palabra ya corregida, el
+            # texto que se escribe sale bien: el sesgo hace el reconocimiento
+            # más probable, esto lo garantiza.
+            to_inject = corrections.apply(to_inject)
+            text = corrections.apply(text)
             if self._deferred:
                 to_inject = ("".join(self._deferred) + to_inject).strip()
                 self._deferred = []
@@ -431,8 +633,11 @@ class Orchestrator(QObject):
             print(f"[Orchestrator] Error during transcription/injection: {e}")
         finally:
             self._finalizing = False
-            self.ui_widget.update_text_signal.emit("")
-            self.ui_widget.update_ui_signal.emit("ready")
+            # El globo no se desvanece todavía: queda unos segundos mostrando
+            # lo que entendió, para poder señalarle una palabra mal. Si no hay
+            # texto, "correctable" se comporta como "ready" y se va igual.
+            self.ui_widget.update_text_signal.emit(text)
+            self.ui_widget.update_ui_signal.emit("correctable")
 
     # ----------------------------------------------------------- inyección --
 
@@ -500,8 +705,60 @@ class Orchestrator(QObject):
         with keyboard.Listener(on_press=self.on_press, on_release=self.on_release) as listener:
             listener.join()
 
+def _install_crash_diagnostics():
+    """Que un crash deje rastro en el log en vez de desaparecer.
+
+    Dos agujeros, los dos por compilar con --noconsole:
+      1. PyQt6 ABORTA el proceso (qFatal) si una excepción de Python queda sin
+         atrapar dentro de un método virtual de Qt, como paintEvent. Sin un
+         sys.excepthook que la escriba, el log corta en seco y solo queda un
+         0xc0000409 en el Visor de eventos. Así perdimos el IndexError de
+         `_flagged` el 22/09.
+      2. qFatal/qWarning escriben desde C++, no por sys.stderr, así que el
+         _Tee de app_log no los ve. qInstallMessageHandler los trae a Python.
+    """
+    import faulthandler
+    import traceback
+
+    from PyQt6.QtCore import qInstallMessageHandler, QtMsgType
+
+    def _excepthook(tipo, valor, tb):
+        print("=" * 60)
+        print("EXCEPCIÓN NO ATRAPADA (si viene de un virtual de Qt, ahora aborta):")
+        traceback.print_exception(tipo, valor, tb)
+        print("=" * 60)
+        sys.stderr.flush()
+
+    sys.excepthook = _excepthook
+
+    _niveles = {
+        QtMsgType.QtDebugMsg: "debug",
+        QtMsgType.QtInfoMsg: "info",
+        QtMsgType.QtWarningMsg: "AVISO",
+        QtMsgType.QtCriticalMsg: "CRÍTICO",
+        QtMsgType.QtFatalMsg: "FATAL",
+    }
+
+    def _qt_handler(modo, contexto, mensaje):
+        etiqueta = _niveles.get(modo, "qt")
+        donde = ""
+        if contexto is not None and contexto.file:
+            donde = f" ({contexto.file}:{contexto.line})"
+        print(f"[Qt/{etiqueta}] {mensaje}{donde}")
+        sys.stderr.flush()
+
+    qInstallMessageHandler(_qt_handler)
+
+    # Para una caída dura de verdad (segfault): vuelca las pilas al log.
+    try:
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[diag] faulthandler no arrancó: {exc}")
+
+
 if __name__ == '__main__':
     app_log.install()
+    _install_crash_diagnostics()
     # Ensure PyQt doesn't quit if settings window closes
     QApplication.setQuitOnLastWindowClosed(False)
     app = QApplication(sys.argv)
@@ -510,6 +767,10 @@ if __name__ == '__main__':
     # mientras carga la IA y durante cada toma, y desaparece el resto del
     # tiempo. Lo demás vive en el ícono de la bandeja.
     ui = DictationBubble()
+    # El corrector es COM: se crea en el hilo de Qt, que es el único que lo usa
+    # (marcar palabras al pintar el globo, e ignorar términos al corregir).
+    speller = SystemSpellChecker(load_config().get("language", "es"))
+    ui.set_spellchecker(speller)
 
     # Orchestrator
     orchestrator = Orchestrator(ui)
@@ -519,6 +780,9 @@ if __name__ == '__main__':
     # Settings Window
     settings_win = SettingsWindow()
     settings_win.settings_saved.connect(orchestrator.apply_new_config)
+    ui.correction_made.connect(orchestrator.on_correction)
+    orchestrator.speller = speller
+    orchestrator._teach_speller()
 
     # Batch transcription window — shares the orchestrator's Transcriber
     # via a lambda so it always sees the current instance (after model

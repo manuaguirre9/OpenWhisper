@@ -58,6 +58,15 @@ class _Tee:
     def isatty(self):
         return False
 
+    def fileno(self):
+        """El descriptor del archivo de log.
+
+        Lo necesita faulthandler, que escribe la pila de una caída dura desde C
+        y por lo tanto no puede pasar por write(): quiere un fd de verdad.
+        Devolver el del log es justo lo que queremos, así el volcado termina
+        en el mismo lugar que todo lo demás."""
+        return self._file.fileno()
+
 
 def install():
     try:

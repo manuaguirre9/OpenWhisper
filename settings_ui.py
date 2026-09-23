@@ -1,13 +1,14 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
-    QMessageBox, QPlainTextEdit, QSpinBox, QFrame,
+    QMessageBox, QPlainTextEdit, QSpinBox, QFrame, QListWidget, QListWidgetItem,
 )
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import pyqtSignal, Qt
 import sounddevice as sd
 
 from config_manager import load_config, save_config
 from system_info import physical_core_count, logical_core_count, resolve_cpu_threads
 from theme import WINDOW_QSS, apply_windows_dark_titlebar
+import corrections
 
 
 class SettingsWindow(QWidget):
@@ -63,11 +64,19 @@ class SettingsWindow(QWidget):
         # --- Motor ---
         # Moonshine es streaming nativo: muestra texto mientras hablás y la
         # espera al terminar es ~0,1s. Whisper es el camino MIT, sin texto en
-        # vivo (cada frase se decodifica cuando cierra).
+        # vivo (cada frase se decodifica cuando cierra). El híbrido usa los dos
+        # a la vez: Moonshine llena el globo mientras hablás, Whisper decodifica
+        # en paralelo y es SU texto el que se escribe. Cuesta los dos modelos en
+        # memoria y CPU. Nemotron 3.5 hace las dos cosas con UN solo modelo:
+        # muestra en vivo, puntúa, la espera al soltar es 0,00s y detecta el
+        # idioma solo (castellano con términos en inglés, o inglés entero).
+        # Es además el más barato de CPU: RTF 0,19 con 4 hilos.
         self.engine_combo = QComboBox()
         self.engines = {
+            "nemotron": "Nemotron 3.5 (vivo + puntuación)",
             "moonshine": "Moonshine (texto en vivo)",
             "whisper": "Whisper (faster-whisper)",
+            "hibrido": "Híbrido (Moonshine en vivo + Whisper escribe)",
         }
         for code, name in self.engines.items():
             self.engine_combo.addItem(name, userData=code)
@@ -151,6 +160,28 @@ class SettingsWindow(QWidget):
         self.vocab_edit.setFixedHeight(100)
         layout.addWidget(self.vocab_edit)
 
+        # --- Correcciones aprendidas ---
+        # Se muestran para que nada quede aprendido a espaldas del usuario, y
+        # porque un error consistente (el modelo escribe SIEMPRE "fronten")
+        # queda guardado igual de bien que un acierto: hay que poder sacarlo.
+        corr_label = QLabel("Correcciones aprendidas")
+        corr_label.setObjectName("section")
+        layout.addWidget(corr_label)
+
+        corr_hint = QLabel(
+            "Las palabras que corregiste en el globo al terminar una toma. "
+            "Doble clic para olvidar una."
+        )
+        corr_hint.setObjectName("subtle")
+        corr_hint.setWordWrap(True)
+        layout.addWidget(corr_hint)
+
+        self.corr_list = QListWidget()
+        self.corr_list.setFixedHeight(96)
+        self.corr_list.itemDoubleClicked.connect(self._forget_correction)
+        layout.addWidget(self.corr_list)
+        self._reload_corrections()
+
         layout.addStretch()
 
         note = QLabel("Cambiar el motor, el modelo, el idioma o los hilos recarga la IA.")
@@ -218,6 +249,34 @@ class SettingsWindow(QWidget):
         except Exception as e:
             print(f"Error enumerating audio devices: {e}")
             self.mic_combo.addItem("Error detectando micrófonos", userData="default")
+
+    def _reload_corrections(self):
+        self.corr_list.clear()
+        pairs = corrections.load()
+        if not pairs:
+            item = QListWidgetItem("Todavía ninguna. Corregí una palabra en el globo.")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.corr_list.addItem(item)
+            return
+        # Al revés: lo último que corregiste es lo que querés ver primero.
+        for wrong, right in reversed(list(pairs.items())):
+            item = QListWidgetItem(f"{wrong}  →  {right}")
+            item.setData(Qt.ItemDataRole.UserRole, wrong)
+            self.corr_list.addItem(item)
+
+    def _forget_correction(self, item):
+        wrong = item.data(Qt.ItemDataRole.UserRole)
+        if not wrong:
+            return
+        corrections.remove(wrong)
+        self._reload_corrections()
+        # El motor tiene que dejar de sesgar hacia ese término ya mismo.
+        self.settings_saved.emit(self.config)
+
+    def showEvent(self, event):
+        # Pudo haber corregido palabras desde la última vez que abrió esto.
+        self._reload_corrections()
+        super().showEvent(event)
 
     def save_settings(self):
         self.config["microphone"] = self.mic_combo.currentData()
