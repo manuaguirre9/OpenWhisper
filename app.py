@@ -12,6 +12,7 @@ from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QCursor
 from audio_capture import AudioRecorder
 from segment_asr import SegmentASR
 import corrections
+import question_marks
 from spellcheck_win import SystemSpellChecker
 from transcription_engine import Transcriber
 from config_manager import load_config
@@ -647,6 +648,9 @@ class Orchestrator(QObject):
             # más probable, esto lo garantiza.
             to_inject = corrections.apply(to_inject)
             text = corrections.apply(text)
+            # El modelo casi nunca cierra las preguntas cortas: ver question_marks.py.
+            to_inject = question_marks.fix(to_inject)
+            text = question_marks.fix(text)
             t1 = time.perf_counter()
             # Vaciar la cola ANTES de leer _deferred: el injector difiere las
             # frases que caen con modificadores apretados, y si lo leyéramos

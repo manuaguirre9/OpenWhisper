@@ -68,6 +68,14 @@ from config_manager import CONFIG_DIR
 
 SAMPLE_RATE = 16000
 
+# Silencio que se le agrega al final antes de cerrar el stream. Sin él, si
+# soltás la tecla justo al terminar de hablar, el modelo no llega a ver el
+# final: MEDIDO con la cola recortada, 0s pierde las últimas 1-2 palabras
+# (`…para que lo cu`), 0,66s las recupera, y recién con 1,0s aparece el `?`
+# de `¿cómo estás?`. Más de 1s no cambió nada. Cuesta ~0,2s de espera.
+TAIL_PAD_S = 1.0
+_TAIL_PAD = np.zeros(int(TAIL_PAD_S * SAMPLE_RATE), dtype=np.float32)
+
 MODEL_DIR = Path(CONFIG_DIR) / "models" / "nemotron-3.5-streaming-560ms"
 MODEL_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
@@ -169,6 +177,7 @@ class NemotronSession:
         if not self._finished:
             self._finished = True
             try:
+                self._stream.accept_waveform(SAMPLE_RATE, _TAIL_PAD)
                 self._stream.input_finished()
                 self._drain(final=True)
             except Exception as exc:  # noqa: BLE001
@@ -267,6 +276,7 @@ class NemotronEngine:
                     segment_cb(seg, frac)
             emitidos = len(nuevos)
 
+        stream.accept_waveform(SAMPLE_RATE, _TAIL_PAD)   # por si el archivo corta en seco
         stream.input_finished()
         while self.recognizer.is_ready(stream):
             self.recognizer.decode_stream(stream)
