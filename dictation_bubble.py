@@ -34,6 +34,9 @@ from PyQt6.QtGui import QFont, QFontMetrics, QPainter, QColor, QCursor, QPen
 
 import corrections
 
+# Puntuación que puede venir pegada a una palabra del globo (`farada,`).
+_EDGE_PUNCT = ".,;:¿?¡!()[]\"'«»…"
+
 # Paleta compartida con batch_window.py: negro mate, sin borde ni sombra.
 WF_SURFACE = QColor(14, 14, 18, 255)
 WF_ON_SURFACE = QColor(232, 232, 240, 235)
@@ -306,7 +309,7 @@ class DictationBubble(QWidget):
         if self._speller is None:
             return
         for i, (token, _) in enumerate(self._words):
-            clean = token.strip(".,;:¿?¡!()[]\"'«»…")
+            clean = token.strip(_EDGE_PUNCT)
             if len(clean) < 4 or not clean.isalpha():
                 continue
             try:
@@ -319,7 +322,7 @@ class DictationBubble(QWidget):
         if self._speller is None or " " in text:
             return []
         try:
-            return self._speller.suggest(text.strip(".,;:¿?¡!()[]\"'«»…"), 3)
+            return self._speller.suggest(text.strip(_EDGE_PUNCT), 3)
         except Exception:
             return []
 
@@ -424,7 +427,8 @@ class DictationBubble(QWidget):
     def _open_editor(self, token, rect):
         self._close_editor()
         self._editor = _WordEditor(token, self._suggestions_for(token), self)
-        self._editor.committed.connect(lambda right, w=token: self._commit(w, right))
+        self._editor.committed.connect(
+            lambda right, w=token, s=self._sel: self._commit(w, right, s))
         self._editor.closed.connect(self._editor_closed)
         # Centrado sobre la palabra y apoyado arriba del globo.
         gr = self.geometry()
@@ -435,10 +439,33 @@ class DictationBubble(QWidget):
         x = max(screen.left() + 8, min(x, screen.right() - ew - 8))
         self._editor.popup(QPoint(x, y))
 
-    def _commit(self, wrong, right):
-        right = (right or "").strip()
-        if right and right != wrong:
-            self.correction_made.emit(wrong, right)
+    def _commit(self, wrong, right, sel):
+        # La puntuación de los bordes es de la frase, no de la palabra: el
+        # token llega como `superiferia,` y la regla tiene que ser
+        # superiferia → periferia. Si la coma entrara en la regla, apply()
+        # la duplicaría cada vez (`periferia,,`).
+        lead = wrong[:len(wrong) - len(wrong.lstrip(_EDGE_PUNCT))]
+        trail = wrong[len(wrong.rstrip(_EDGE_PUNCT)):]
+        core_wrong = wrong.strip(_EDGE_PUNCT)
+        core_right = " ".join((right or "").strip(_EDGE_PUNCT + " ").split())
+        if not core_right or core_right == core_wrong:
+            return
+        self.correction_made.emit(core_wrong, core_right)
+
+        # Y que se vea: sin esto el globo seguía mostrando la palabra vieja.
+        if sel is None or self.state != "correctable":
+            return
+        a, b = sel
+        tokens = [t for t, _ in self._words]
+        if b >= len(tokens):
+            return
+        tokens[a:b + 1] = [lead + core_right + trail]
+        self._text = " ".join(tokens)
+        self._sel = None
+        self._hover = -1
+        self._layout_text()
+        self._flag_words()
+        self.update()
 
     def _editor_closed(self):
         self._editor = None
