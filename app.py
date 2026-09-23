@@ -822,6 +822,7 @@ if __name__ == '__main__':
     batch_win = BatchTranscriptionWindow(
         dictation_transcriber_provider=lambda: orchestrator.transcriber,
         config_provider=lambda: orchestrator.config,
+        nemotron_provider=lambda: orchestrator.nemotron,
     )
 
     # System Tray

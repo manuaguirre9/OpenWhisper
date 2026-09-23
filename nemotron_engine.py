@@ -199,6 +199,9 @@ class NemotronEngine:
             enable_endpoint_detection=False,   # ver el encabezado: cortar mata la puntuación
         )
         self.vocabulary = ""
+        # La ventana de archivos identifica los modelos por este campo (compara
+        # contra el del Transcriber de Whisper para reusar el que ya esté cargado).
+        self.model_size = "nemotron"
         print("[Nemotron] Listo.")
 
     def set_vocabulary(self, vocabulary: str):
@@ -212,6 +215,133 @@ class NemotronEngine:
         with self._lock:
             return NemotronSession(self.recognizer, on_partial=on_partial,
                                    on_line=on_line, on_error=on_error)
+
+    # ------------------------------------------------- transcribir archivos --
+    #
+    # La ventana de "Transcribir archivo…" habla con un objeto que expone
+    # `model_size` y `transcribe_file()`. Implementarlos acá deja que el motor
+    # entre en esa lista sin que la ventana tenga que saber que no es Whisper,
+    # y permite REUSAR el modelo que el dictado ya tiene cargado en vez de
+    # levantar otros 650 MB.
+
+    def transcribe_file(self, audio_path, language=None, segment_cb=None,
+                        cancel_check=None, task="transcribe"):
+        """Transcribe un archivo entero. Devuelve (segmentos, info) con la
+        misma forma que Transcriber.transcribe_file.
+
+        No usa el detector de fin de frase de sherpa-onnx —arruina la
+        puntuación, ver el encabezado— sino que decodifica de un tirón y
+        DESPUÉS corta en frases usando los timestamps por token. Así el SRT y
+        la diarización tienen tiempos, y el texto conserva los signos.
+        """
+        if task == "translate":
+            raise ValueError(
+                "Nemotron no traduce: solo transcribe en el idioma hablado. "
+                "Para traducir al inglés elegí un modelo Whisper."
+            )
+        from faster_whisper.audio import decode_audio   # trae av/ffmpeg: mp3, m4a, mp4…
+
+        audio = decode_audio(str(audio_path), sampling_rate=SAMPLE_RATE)
+        total = len(audio)
+        duration = total / SAMPLE_RATE if total else 1.0
+
+        with self._lock:
+            stream = self.recognizer.create_stream()
+
+        segmentos, emitidos = [], 0
+        paso = SAMPLE_RATE * 10          # 10s de audio por vuelta: progreso fluido
+        for inicio in range(0, total, paso):
+            if cancel_check is not None and cancel_check():
+                return segmentos, {"language": language or "auto",
+                                   "language_probability": 0.0, "duration": duration}
+            stream.accept_waveform(SAMPLE_RATE, audio[inicio:inicio + paso])
+            while self.recognizer.is_ready(stream):
+                self.recognizer.decode_stream(stream)
+            # Entregar las frases YA cerradas, para que la ventana muestre el
+            # texto mientras avanza en vez de esperar al final.
+            frac = min(1.0, (inicio + paso) / total) if total else 1.0
+            nuevos = self._segments_from(stream, cerrar=False)
+            for seg in nuevos[emitidos:]:
+                segmentos.append(seg)
+                if segment_cb is not None:
+                    segment_cb(seg, frac)
+            emitidos = len(nuevos)
+
+        stream.input_finished()
+        while self.recognizer.is_ready(stream):
+            self.recognizer.decode_stream(stream)
+        for seg in self._segments_from(stream, cerrar=True)[emitidos:]:
+            segmentos.append(seg)
+            if segment_cb is not None:
+                segment_cb(seg, 1.0)
+
+        return segmentos, {"language": language or "auto",
+                           "language_probability": 0.0, "duration": duration}
+
+    # Una frase cierra con alguno de estos, o tras un silencio largo.
+    _FIN_DE_FRASE = (".", "?", "!", "…")
+    _PAUSA_LARGA = 0.8      # segundos entre tokens que cuentan como corte
+    _MAX_SEG = 15.0         # ningún subtítulo más largo que esto
+
+    def _segments_from(self, stream, cerrar):
+        """Arma {start, end, text} a partir de los tokens y sus tiempos.
+
+        `cerrar=False` deja afuera la última frase si todavía no terminó: el
+        decoder puede seguir agregándole palabras. Con `cerrar=True` se entrega
+        lo que quede. Los transductores no reescriben lo ya emitido, así que
+        una frase cerrada no va a cambiar después.
+        """
+        import json
+
+        datos = json.loads(self.recognizer.get_result_as_json_string(stream))
+        tokens = datos.get("tokens") or []
+        tiempos = datos.get("timestamps") or []
+        if not tokens or len(tiempos) < len(tokens):
+            return []
+
+        salida, actual, t0 = [], [], None
+        fin_palabra = None      # último token que NO es puntuación: marca el end
+        for i, tok in enumerate(tokens):
+            if t0 is None:
+                t0 = tiempos[i]
+            actual.append(tok)
+            if not self._solo_puntuacion(tok):
+                fin_palabra = tiempos[i]
+            cierra_frase = tok.strip().endswith(self._FIN_DE_FRASE)
+            hueco = (tiempos[i + 1] - tiempos[i]) if i + 1 < len(tokens) else 0.0
+            corta = (cierra_frase
+                     or hueco >= self._PAUSA_LARGA
+                     or (tiempos[i] - t0) >= self._MAX_SEG)
+
+            # El punto de una frase suele llegar DESPUÉS del silencio que la
+            # separa de la siguiente. Si cortáramos por ese silencio, el signo
+            # quedaría como un segmento suelto que dice solo ".", y el SRT se
+            # llenaría de subtítulos de un carácter. Así que si lo único que
+            # falta es ese signo, se espera una vuelta más y entra en la frase
+            # que le corresponde.
+            if corta and not cierra_frase and i + 1 < len(tokens) \
+                    and self._solo_puntuacion(tokens[i + 1]):
+                continue
+
+            if corta:
+                texto = "".join(actual).strip()
+                if texto:
+                    salida.append({"start": float(t0),
+                                   "end": float(fin_palabra if fin_palabra is not None else tiempos[i]),
+                                   "text": " " + texto})
+                actual, t0, fin_palabra = [], None, None
+        if cerrar and actual:
+            texto = "".join(actual).strip()
+            if texto:
+                salida.append({"start": float(t0),
+                               "end": float(fin_palabra if fin_palabra is not None else tiempos[-1]),
+                               "text": " " + texto})
+        return salida
+
+    @staticmethod
+    def _solo_puntuacion(token: str) -> bool:
+        t = token.strip()
+        return bool(t) and all(c in ".,;:¿?¡!…-–—\"'" for c in t)
 
     def close(self):
         pass

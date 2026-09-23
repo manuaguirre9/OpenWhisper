@@ -50,6 +50,19 @@ SUPPORTED_EXTS = {".mp3", ".wav", ".m4a", ".mp4", ".ogg", ".oga", ".flac",
 # but is heavy (~3GB RAM) and slow on CPU — leave it in for users who want it.
 MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v3"]
 
+# Lo que se ofrece en el desplegable: (código, etiqueta). El código es el que
+# viaja por todo el pipeline y el que compara _resolve_transcriber contra el
+# `model_size` del motor cargado.
+#
+# Nemotron entra como una opción más y no como otro control aparte porque para
+# el usuario es la misma decisión: con qué transcribir este archivo. Lo que sí
+# cambia es que no traduce y detecta el idioma solo, así que al elegirlo se
+# desactivan esos dos controles en vez de dejarlos mintiendo.
+MODEL_CHOICES = [(m, f"Whisper {m}") for m in MODEL_SIZES] + [
+    ("nemotron", "Nemotron 3.5  ·  rápido, puntúa, sin traducción"),
+]
+NEMOTRON = "nemotron"
+
 # Status values for a queued file.
 ST_PENDING = "pending"
 ST_RUNNING = "running"
@@ -320,12 +333,20 @@ class ModelLoaderWorker(QThread):
 
     def run(self):
         try:
-            t = Transcriber(
-                model_size=self.model_size,
-                cpu_threads=self.cpu_threads,
-                vocabulary=self.vocabulary,
-                progress_cb=lambda done, total: self.download_progress.emit(done, total),
-            )
+            if self.model_size == NEMOTRON:
+                from nemotron_engine import NemotronEngine
+                from system_info import resolve_cpu_threads
+                t = NemotronEngine(
+                    num_threads=resolve_cpu_threads(self.cpu_threads),
+                    progress_cb=lambda done, total: self.download_progress.emit(done, total),
+                )
+            else:
+                t = Transcriber(
+                    model_size=self.model_size,
+                    cpu_threads=self.cpu_threads,
+                    vocabulary=self.vocabulary,
+                    progress_cb=lambda done, total: self.download_progress.emit(done, total),
+                )
             self.loaded.emit(t)
         except Exception as e:
             traceback.print_exc()
@@ -444,13 +465,17 @@ class DropZone(QFrame):
 # ---------- main window ----------
 
 class BatchTranscriptionWindow(QMainWindow):
-    def __init__(self, dictation_transcriber_provider, config_provider, parent=None):
+    def __init__(self, dictation_transcriber_provider, config_provider,
+                 nemotron_provider=None, parent=None):
         super().__init__(parent)
         # Provider that returns the Transcriber used for live dictation.
         # We reuse it whenever the user picks the same model in this window;
         # otherwise we load a dedicated batch transcriber.
         self.dictation_transcriber_provider = dictation_transcriber_provider
         self.config_provider = config_provider
+        # Devuelve el NemotronEngine del dictado si el motor activo es ese, para
+        # reusar sus 650 MB en vez de cargar una segunda copia.
+        self.nemotron_provider = nemotron_provider or (lambda: None)
 
         self.entries: List[FileEntry] = []
         self.current_index: Optional[int] = None    # being processed
@@ -508,24 +533,30 @@ class BatchTranscriptionWindow(QMainWindow):
         model_label = QLabel("Modelo de IA")
         model_label.setMinimumWidth(100)
         self.model_combo = QComboBox()
-        self.model_combo.addItems(MODEL_SIZES)
-        # Default to whatever dictation is using, falling back to config, then "base".
+        for code, label in MODEL_CHOICES:
+            self.model_combo.addItem(label, userData=code)
+        # Por defecto, lo que YA esté cargado: el dictado primero (así no se
+        # levanta un segundo modelo para nada), y si no, lo que diga la config.
+        cfg = self.config_provider() or {}
         default_model = "base"
-        dict_trans = self.dictation_transcriber_provider()
-        if dict_trans is not None:
-            default_model = dict_trans.model_size
+        if self.nemotron_provider() is not None:
+            default_model = NEMOTRON
         else:
-            default_model = (self.config_provider() or {}).get("model_size", "base")
-        if default_model in MODEL_SIZES:
-            self.model_combo.setCurrentText(default_model)
-        self.model_combo.currentTextChanged.connect(self._on_model_changed)
+            dict_trans = self.dictation_transcriber_provider()
+            if dict_trans is not None:
+                default_model = dict_trans.model_size
+            else:
+                default_model = cfg.get("model_size", "base")
+        idx = self.model_combo.findData(default_model)
+        if idx >= 0:
+            self.model_combo.setCurrentIndex(idx)
+        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
         self.model_status_label = QLabel("")
         self.model_status_label.setObjectName("subtle")
         model_row.addWidget(model_label)
         model_row.addWidget(self.model_combo)
         model_row.addWidget(self.model_status_label, stretch=1)
         layout.addLayout(model_row)
-        self._refresh_model_status()
 
         # Idioma del audio y traducción. Antes se usaba el idioma del dictado
         # sin poder cambiarlo; un archivo puede venir en cualquier idioma.
@@ -555,6 +586,9 @@ class BatchTranscriptionWindow(QMainWindow):
         lang_row.addWidget(self.translate_checkbox)
         lang_row.addStretch(1)
         layout.addLayout(lang_row)
+        # Recién acá existen translate_checkbox y lang_combo, que _sync toca.
+        self._sync_model_controls()
+        self._refresh_model_status()
 
         # Diarization controls
         diar_row = QHBoxLayout()
@@ -946,7 +980,7 @@ class BatchTranscriptionWindow(QMainWindow):
     def _on_transcribe_clicked(self):
         if self.worker is not None or self.loader is not None or self.diar_downloader is not None:
             return
-        selected = self.model_combo.currentText()
+        selected = self.model_combo.currentData()
 
         def proceed_with_model():
             transcriber = self._resolve_transcriber(selected)
@@ -965,6 +999,13 @@ class BatchTranscriptionWindow(QMainWindow):
     def _resolve_transcriber(self, model_size):
         """Return a ready Transcriber for `model_size`, or None if we need
         to load one. Prefers the dictation instance to save RAM."""
+        if model_size == NEMOTRON:
+            vivo = self.nemotron_provider()
+            if vivo is not None:
+                return vivo
+            return (self.batch_transcriber
+                    if getattr(self.batch_transcriber, "model_size", None) == NEMOTRON
+                    else None)
         dict_trans = self.dictation_transcriber_provider()
         if dict_trans is not None and dict_trans.model_size == model_size:
             return dict_trans
@@ -1075,12 +1116,36 @@ class BatchTranscriptionWindow(QMainWindow):
         self.worker.finished.connect(self._on_worker_finished)
         self.worker.start()
 
-    def _on_model_changed(self, _new_text):
+    def _on_model_changed(self, _idx):
+        self._sync_model_controls()
         self._refresh_model_status()
         self._refresh_buttons()
 
+    def _sync_model_controls(self):
+        """Nemotron no traduce y detecta el idioma solo: en vez de dejar esos
+        controles puestos sin efecto, se desactivan y se explica por qué."""
+        es_nemo = self.model_combo.currentData() == NEMOTRON
+        self.translate_checkbox.setEnabled(not es_nemo)
+        self.lang_combo.setEnabled(not es_nemo)
+        if es_nemo:
+            self.translate_checkbox.setChecked(False)
+            self.translate_checkbox.setToolTip(
+                "Nemotron solo transcribe en el idioma hablado. Para traducir "
+                "al inglés elegí un modelo Whisper."
+            )
+            self.lang_combo.setToolTip(
+                "Nemotron detecta el idioma solo, incluso si mezclás idiomas "
+                "en el mismo audio."
+            )
+        else:
+            self.translate_checkbox.setToolTip(
+                "Whisper solo sabe traducir hacia el inglés. El texto sale en "
+                "inglés sea cual sea el idioma del audio."
+            )
+            self.lang_combo.setToolTip("")
+
     def _refresh_model_status(self):
-        selected = self.model_combo.currentText()
+        selected = self.model_combo.currentData()
         ready = self._resolve_transcriber(selected) is not None
         if ready:
             self.model_status_label.setText("✓ Cargado")
