@@ -792,8 +792,37 @@ def _install_crash_diagnostics():
         print(f"[diag] faulthandler no arrancó: {exc}")
 
 
+_INSTANCE_MUTEX = None  # el handle vive mientras viva el proceso
+
+
+def _claim_single_instance() -> bool:
+    """True si somos la única instancia abierta.
+
+    Dos instancias escuchan el mismo atajo y pegan el texto dos veces. Un mutex
+    con nombre de Windows lo evita: el sistema lo libera solo cuando el proceso
+    muere, incluso si se cae o lo matan, así que nunca queda trabado."""
+    global _INSTANCE_MUTEX
+    import ctypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    _INSTANCE_MUTEX = kernel32.CreateMutexW(None, False, "Local\\OpenWhisper-una-sola-instancia")
+    ERROR_ALREADY_EXISTS = 183
+    return not (_INSTANCE_MUTEX and ctypes.get_last_error() == ERROR_ALREADY_EXISTS)
+
+
 if __name__ == '__main__':
     app_log.install()
+    if not _claim_single_instance():
+        print("[inicio] OpenWhisper ya está abierto; esta instancia se cierra.")
+        import ctypes
+        MB_ICONINFORMATION, MB_SETFOREGROUND = 0x40, 0x10000
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "OpenWhisper ya está abierto.\n\nBuscalo en el ícono de la bandeja (abajo a la derecha).",
+            "OpenWhisper",
+            MB_ICONINFORMATION | MB_SETFOREGROUND,
+        )
+        sys.exit(0)
     _install_crash_diagnostics()
     # Ensure PyQt doesn't quit if settings window closes
     QApplication.setQuitOnLastWindowClosed(False)
