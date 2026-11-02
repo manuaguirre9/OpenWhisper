@@ -22,18 +22,31 @@ El modelo cubre 40 locales. Sin indicación los autodetecta, y en el uso real
 eso a veces sale MAL: 3 de 57 tomas del log salieron en cirílico o japonés
 (`Чика десі во- gasto podjalar…`, `まあ、これを`) siendo castellano.
 
-Pero el encoder acepta un "prompt" de idioma (`prompt_index`, que sherpa-onnx
-expone como la opción de stream `language`). Fijarlo NO rompe el inglés: MEDIDO
-con `es-US`, el clip de LibriSpeech en inglés sale idéntico (WER 0) y los dos
-clips rioplatenses también (`Tenés`, signos intactos). O sea que el idioma
-fijado es un sesgo, no un filtro: el castellano con inglés mezclado sigue
-funcionando y se cierra la puerta al cirílico. Por eso se respeta el Idioma de
-la configuración (antes este motor lo ignoraba).
+El encoder acepta un "prompt" de idioma (`prompt_index`, que sherpa-onnx expone
+como la opción de stream `language`), y fijarlo cierra la puerta al cirílico.
+Pero NO es gratis: MEDIDO sobre FLEURS (20 frases reales por idioma), fijar
+`es-US` DUPLICA los errores en frases enteras en inglés (WER 8,4% → 16,2%, a
+veces se come el principio: `The major religion in Moldova…` → `Irthodox
+Christian`) y en castellano no mejora nada (4,2% auto vs 4,6% fijado). Y el
+usuario dicta ~8% de sus tomas enteras en inglés: tanto como las que salían en
+otro alfabeto. (Un solo clip de LibriSpeech había dicho "no rompe el inglés":
+era muy poca muestra.)
 
-    es  → es-US   (latinoamericano. es-ES rindió igual con buen nivel, pero a
-                   nivel bajo metió un `Tenéis` donde se dijo `Tenés`)
-    en  → en-US   (OJO: con `en-US` el castellano sale VACÍO, no traducido)
-    auto → sin prompt
+Así que se usa la lectura AUTOMÁTICA, y si tiene letras de otro alfabeto
+(`foreign_script`) se abre una segunda lectura con el idioma configurado
+fijado, que se pone al día con el audio guardado de la toma y desde ahí sigue
+en paralelo. Se probó tener las dos SIEMPRE: misma precisión, pero la espera al
+soltar subió de mediana 0,44 s a 0,73 s (máx 2,5 s) con la PC ocupada. Bajo
+demanda, el 95% de las tomas cuesta lo mismo que una sola lectura, y la que se
+fue de alfabeto paga una vez ~0,2-0,3 s por segundo de toma.
+
+    es  → respaldo es-US  (latinoamericano. es-ES rindió igual con buen nivel,
+                           pero a nivel bajo metió `Tenéis` por `Tenés`)
+    en  → respaldo en-US  (OJO: fijado en en-US, el castellano sale VACÍO)
+    auto → una sola lectura, sin respaldo
+
+La ventana de archivos sí FIJA el idioma si se elige uno: ahí es una elección
+explícita para ese archivo.
 
 NIVEL DE ENTRADA
 ----------------
@@ -77,6 +90,7 @@ Uso:
 import os
 import tarfile
 import threading
+import unicodedata
 import urllib.request
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -113,6 +127,13 @@ def language_prompt(lang: Optional[str]) -> Optional[str]:
     if not lang or lang == "auto":
         return None
     return _LANG_PROMPT.get(lang, lang)
+
+
+def foreign_script(text: str) -> bool:
+    """¿Hay alguna letra que no sea del alfabeto latino? (cirílico, japonés,
+    árabe…). Los números y signos no cuentan."""
+    return any(c.isalpha() and not unicodedata.name(c, "").startswith("LATIN")
+               for c in text)
 
 
 class _Gain:
@@ -217,10 +238,16 @@ class NemotronSession:
     def __init__(self, recognizer, on_partial=None, on_line=None, on_error=None,
                  language: Optional[str] = None, gain: Optional[_GainTake] = None):
         self._rec = recognizer
+        # La lectura automática es la que se usa. Si hay idioma configurado y
+        # la automática se va a otro alfabeto, recién ahí se abre una segunda
+        # lectura con el idioma fijado, que se pone al día con el audio
+        # guardado. Ver "IDIOMA" en el encabezado.
         self._stream = recognizer.create_stream()
-        prompt = language_prompt(language)
-        if prompt:
-            self._stream.set_option("language", prompt)
+        self._prompt = language_prompt(language)
+        self._fallback = None
+        self._audio: List[np.ndarray] = []     # solo para ponerse al día
+        self._streams = [self._stream]
+        self.used_fallback = False
         self._gain = gain
         self.on_partial = on_partial
         self.on_line = on_line
@@ -237,7 +264,10 @@ class NemotronSession:
             chunk = np.asarray(chunk, dtype=np.float32)
             if self._gain is not None:
                 chunk = self._gain(chunk)
-            self._stream.accept_waveform(SAMPLE_RATE, chunk)
+            if self._prompt and self._fallback is None:
+                self._audio.append(chunk)
+            for s in self._streams:
+                s.accept_waveform(SAMPLE_RATE, chunk)
             self._drain()
         except Exception as exc:  # noqa: BLE001 - una toma mala no mata la app
             self._error(exc)
@@ -248,14 +278,40 @@ class NemotronSession:
         No cierra frases: ver el encabezado del módulo. El texto crece durante
         toda la toma y se cierra recién en finish().
         """
-        while self._rec.is_ready(self._stream):
-            self._rec.decode_stream(self._stream)
-
+        self._decode()
         text = (self._rec.get_result(self._stream) or "").strip()
+        self.used_fallback = False
+        if self._prompt and foreign_script(text):
+            if self._fallback is None:
+                self._open_fallback(final)
+            text = (self._rec.get_result(self._fallback) or "").strip()
+            self.used_fallback = True
         if text != self._partial:
             self._partial = text
             if not final and self.on_partial is not None:
                 self.on_partial(text)
+
+    def _decode(self):
+        while True:
+            ready = [s for s in self._streams if self._rec.is_ready(s)]
+            if not ready:
+                return
+            self._rec.decode_streams(ready)     # si hay dos, en un solo lote
+
+    def _open_fallback(self, final):
+        """Abre la lectura con idioma fijado y le pasa todo lo oído hasta acá.
+        Cuesta ~0,2-0,3 s de cómputo por cada segundo de toma, una sola vez."""
+        fb = self._rec.create_stream()
+        fb.set_option("language", self._prompt)
+        if self._audio:
+            fb.accept_waveform(SAMPLE_RATE, np.concatenate(self._audio))
+        self._audio = []
+        if final:
+            fb.accept_waveform(SAMPLE_RATE, _TAIL_PAD)
+            fb.input_finished()
+        self._fallback = fb
+        self._streams.append(fb)
+        self._decode()
 
     def _error(self, exc):
         print(f"[Nemotron] {exc}")
@@ -279,9 +335,13 @@ class NemotronSession:
             if self._gain is not None:
                 self._gain.done()
             try:
-                self._stream.accept_waveform(SAMPLE_RATE, _TAIL_PAD)
-                self._stream.input_finished()
+                for s in self._streams:
+                    s.accept_waveform(SAMPLE_RATE, _TAIL_PAD)
+                    s.input_finished()
                 self._drain(final=True)
+                if self.used_fallback:
+                    print("[Nemotron] la lectura automática salió en otro alfabeto: "
+                          "uso la del idioma fijado")
             except Exception as exc:  # noqa: BLE001
                 self._error(exc)
         return self.text()
