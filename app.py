@@ -472,9 +472,12 @@ class Orchestrator(QObject):
             # Un solo stream por toma: los parciales van al globo y el texto
             # entero sale en finish(). `on_line` no dispara nunca (cortar por
             # frases le arruina la puntuacion, ver nemotron_engine.py).
+            # El idioma fijado es un sesgo, no un filtro: el inglés mezclado
+            # sigue saliendo, y deja de aparecer cirílico o japonés.
             self._live = self.nemotron.start_session(
                 on_partial=self._on_partial,
                 on_error=lambda e: print(f"[Orchestrator] Nemotron: {e}"),
+                language=self._language(),
             )
             period = 0.1
         elif self.engine_name == "hibrido" and self.moonshine is not None                 and self.transcriber is not None:

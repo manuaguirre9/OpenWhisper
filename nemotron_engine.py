@@ -18,12 +18,31 @@ con 2, o sea que corre a 3,7x tiempo real usando dos hilos.
 
 IDIOMA
 ------
-El modelo cubre 40 locales con AUTODETECCIÓN, y por eso acá no se le fija
-ninguno: el usuario habla castellano con términos en inglés sueltos, y a veces
-frases enteras en inglés. VERIFICADO sin configurar idioma: el clip castellano
-sale perfecto con signos de apertura (`¿Hay algún trabajo…?`) y el clip inglés
-también (`When we took our seats at the breakfast table, …`). Fijar "es" haría
-peor lo mixto, que es el caso real de uso.
+El modelo cubre 40 locales. Sin indicación los autodetecta, y en el uso real
+eso a veces sale MAL: 3 de 57 tomas del log salieron en cirílico o japonés
+(`Чика десі во- gasto podjalar…`, `まあ、これを`) siendo castellano.
+
+Pero el encoder acepta un "prompt" de idioma (`prompt_index`, que sherpa-onnx
+expone como la opción de stream `language`). Fijarlo NO rompe el inglés: MEDIDO
+con `es-US`, el clip de LibriSpeech en inglés sale idéntico (WER 0) y los dos
+clips rioplatenses también (`Tenés`, signos intactos). O sea que el idioma
+fijado es un sesgo, no un filtro: el castellano con inglés mezclado sigue
+funcionando y se cierra la puerta al cirílico. Por eso se respeta el Idioma de
+la configuración (antes este motor lo ignoraba).
+
+    es  → es-US   (latinoamericano. es-ES rindió igual con buen nivel, pero a
+                   nivel bajo metió un `Tenéis` donde se dijo `Tenés`)
+    en  → en-US   (OJO: con `en-US` el castellano sale VACÍO, no traducido)
+    auto → sin prompt
+
+NIVEL DE ENTRADA
+----------------
+Este modelo no normaliza las features (`normalize_type` vacío en el ONNX), así
+que el VOLUMEN le cambia lo que oye. Y el EVO4 de este usuario entra muy bajo:
+pico mediano 0,024 sobre 92 tomas (≈ −32 dBFS). MEDIDO bajando los clips limpios
+a ese nivel: el inglés con idioma fijado perdió media frase (WER 0 → 0,32), el
+castellano largo duplicó errores y apareció `Tenéis`. Subiéndolos a pico 0,3-0,5
+todo vuelve a WER 0. Por eso cada sesión aplica una ganancia (ver `_Gain`).
 
 LICENCIA
 --------
@@ -84,6 +103,80 @@ MODEL_URL = (
 _FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt")
 
 
+# Idioma de la config → prompt del modelo. Las claves del `prompt_dictionary`
+# del encoder; algo que no esté acá se pasa tal cual (sherpa-onnx cae en auto
+# si no lo conoce, y lo avisa por consola).
+_LANG_PROMPT = {"es": "es-US", "en": "en-US"}
+
+
+def language_prompt(lang: Optional[str]) -> Optional[str]:
+    if not lang or lang == "auto":
+        return None
+    return _LANG_PROMPT.get(lang, lang)
+
+
+class _Gain:
+    """Lleva la voz al nivel que el modelo espera, sin bombear dentro de la toma.
+
+    Una ganancia que se ajusta sobre la marcha cambia el nivel de las features
+    a mitad de frase. Así que se FIJA al empezar la toma, a partir del nivel de
+    las tomas anteriores (la voz de una persona en un mismo mic varía poco), y
+    dentro de la toma solo puede BAJAR, si hace falta para no saturar.
+
+    El nivel de una toma se mide como el percentil 90 de los picos por bloque y
+    no como el pico máximo: así un click del teclado o el golpe de la tecla no
+    cuentan como "voz fuerte".
+    """
+    TARGET = 0.3        # pico de voz buscado. MEDIDO: 0,15-0,5 dan todos WER 0
+    MAX_GAIN = 20.0     # +26 dB; más que eso es amplificar ruido de fondo
+    CEIL = 0.95
+    _DEFAULT_LEVEL = 0.05   # primera toma de la sesión, sin historia todavía
+
+    def __init__(self):
+        self.level: Optional[float] = None   # se actualiza al cerrar cada toma
+
+    def start(self) -> "_GainTake":
+        ref = self.level or self._DEFAULT_LEVEL
+        return _GainTake(self, float(np.clip(self.TARGET / ref, 1.0, self.MAX_GAIN)))
+
+    def learn(self, take_level: float):
+        if take_level <= 1e-4:      # toma muda: no dice nada del nivel
+            return
+        self.level = take_level if self.level is None \
+            else 0.5 * self.level + 0.5 * take_level
+
+
+class _GainTake:
+    def __init__(self, owner: _Gain, gain: float):
+        self._owner = owner
+        self.gain = gain
+        self._peaks: List[float] = []
+
+    def __call__(self, chunk: np.ndarray) -> np.ndarray:
+        peak = float(np.max(np.abs(chunk))) if len(chunk) else 0.0
+        self._peaks.append(peak)
+        if peak * self.gain > _Gain.CEIL:
+            self.gain = max(1.0, _Gain.CEIL / peak)
+        return np.clip(chunk * self.gain, -1.0, 1.0).astype(np.float32)
+
+    def done(self):
+        if self._peaks:
+            level = float(np.percentile(self._peaks, 90))
+            print(f"[Nemotron] ganancia x{self.gain:.1f} · nivel de voz {level:.3f}")
+            self._owner.learn(level)
+
+
+def normalize_file_audio(audio: np.ndarray) -> np.ndarray:
+    """Para archivos se tiene el audio entero: alcanza un factor fijo."""
+    if not len(audio):
+        return audio
+    level = float(np.percentile(np.abs(audio), 99.9))
+    if level <= 1e-4:
+        return audio
+    g = float(np.clip(_Gain.TARGET / level, 1.0, _Gain.MAX_GAIN))
+    return np.clip(audio * g, -1.0, 1.0).astype(np.float32)
+
+
 def models_ready() -> bool:
     return all((MODEL_DIR / f).exists() for f in _FILES)
 
@@ -121,9 +214,14 @@ class NemotronSession:
     """Una toma de dictado. No es thread-safe: alimentarla desde un solo hilo,
     igual que MoonshineSession y SegmentASR."""
 
-    def __init__(self, recognizer, on_partial=None, on_line=None, on_error=None):
+    def __init__(self, recognizer, on_partial=None, on_line=None, on_error=None,
+                 language: Optional[str] = None, gain: Optional[_GainTake] = None):
         self._rec = recognizer
         self._stream = recognizer.create_stream()
+        prompt = language_prompt(language)
+        if prompt:
+            self._stream.set_option("language", prompt)
+        self._gain = gain
         self.on_partial = on_partial
         self.on_line = on_line
         self.on_error = on_error
@@ -136,8 +234,10 @@ class NemotronSession:
         if self._finished or len(chunk) == 0:
             return
         try:
-            self._stream.accept_waveform(
-                SAMPLE_RATE, np.asarray(chunk, dtype=np.float32))
+            chunk = np.asarray(chunk, dtype=np.float32)
+            if self._gain is not None:
+                chunk = self._gain(chunk)
+            self._stream.accept_waveform(SAMPLE_RATE, chunk)
             self._drain()
         except Exception as exc:  # noqa: BLE001 - una toma mala no mata la app
             self._error(exc)
@@ -176,6 +276,8 @@ class NemotronSession:
     def finish(self) -> str:
         if not self._finished:
             self._finished = True
+            if self._gain is not None:
+                self._gain.done()
             try:
                 self._stream.accept_waveform(SAMPLE_RATE, _TAIL_PAD)
                 self._stream.input_finished()
@@ -208,6 +310,7 @@ class NemotronEngine:
             enable_endpoint_detection=False,   # ver el encabezado: cortar mata la puntuación
         )
         self.vocabulary = ""
+        self.gain = _Gain()
         # La ventana de archivos identifica los modelos por este campo (compara
         # contra el del Transcriber de Whisper para reusar el que ya esté cargado).
         self.model_size = "nemotron"
@@ -220,10 +323,12 @@ class NemotronEngine:
         texto, que en la práctica es más confiable que el sesgo."""
         self.vocabulary = vocabulary or ""
 
-    def start_session(self, on_partial=None, on_line=None, on_error=None) -> NemotronSession:
+    def start_session(self, on_partial=None, on_line=None, on_error=None,
+                      language: Optional[str] = None) -> NemotronSession:
         with self._lock:
             return NemotronSession(self.recognizer, on_partial=on_partial,
-                                   on_line=on_line, on_error=on_error)
+                                   on_line=on_line, on_error=on_error,
+                                   language=language, gain=self.gain.start())
 
     # ------------------------------------------------- transcribir archivos --
     #
@@ -250,12 +355,16 @@ class NemotronEngine:
             )
         from faster_whisper.audio import decode_audio   # trae av/ffmpeg: mp3, m4a, mp4…
 
-        audio = decode_audio(str(audio_path), sampling_rate=SAMPLE_RATE)
+        audio = normalize_file_audio(
+            decode_audio(str(audio_path), sampling_rate=SAMPLE_RATE))
         total = len(audio)
         duration = total / SAMPLE_RATE if total else 1.0
 
         with self._lock:
             stream = self.recognizer.create_stream()
+        prompt = language_prompt(language)
+        if prompt:
+            stream.set_option("language", prompt)
 
         segmentos, emitidos = [], 0
         paso = SAMPLE_RATE * 10          # 10s de audio por vuelta: progreso fluido
