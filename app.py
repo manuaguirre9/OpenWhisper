@@ -6,8 +6,8 @@ import time
 from pynput import keyboard
 
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
-from PyQt6.QtCore import Qt, QObject
-from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QCursor
+from PyQt6.QtCore import Qt, QObject, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QCursor, QDesktopServices
 
 from audio_capture import AudioRecorder
 from segment_asr import SegmentASR
@@ -880,6 +880,51 @@ if __name__ == '__main__':
     config_action = tray_menu.addAction("Configuración")
     config_action.triggered.connect(settings_win.show)
 
+    # --- Novedades del modelo (ver update_check.py) ---
+    # La consulta va en un hilo (es red); el aviso vuelve al hilo de Qt por
+    # señal, que es el único que puede tocar el ícono de la bandeja.
+    class _Novedades(QObject):
+        listo = pyqtSignal(object, bool)    # (novedades | None | Exception, manual)
+
+    novedades = _Novedades()
+    novedad_url = {"url": None}
+
+    def revisar_novedades(manual=False):
+        def run():
+            import update_check
+            try:
+                res = update_check.check(force=manual)
+            except Exception as e:  # noqa: BLE001
+                res = e
+            novedades.listo.emit(res, manual)
+        threading.Thread(target=run, daemon=True).start()
+
+    def mostrar_novedades(res, manual):
+        info = QSystemTrayIcon.MessageIcon.Information
+        if isinstance(res, Exception):
+            if manual:
+                tray_icon.showMessage("OpenWhisper", "No pude consultar las novedades (¿sin internet?).", info)
+            return
+        if not res:
+            if manual:
+                tray_icon.showMessage("OpenWhisper", "No hay versiones nuevas del modelo.", info)
+            return
+        novedad_url["url"] = res[0]["url"]
+        if len(res) == 1:
+            titulo, texto = res[0]["titulo"], res[0]["texto"]
+        else:
+            titulo = f"{len(res)} novedades del modelo de voz"
+            texto = "\n".join(f"• {n['texto']}" for n in res[:4])
+        tray_icon.showMessage(titulo, texto + "\n(clic para ver)", info, 15000)
+
+    def abrir_novedad():
+        if novedad_url["url"]:
+            QDesktopServices.openUrl(QUrl(novedad_url["url"]))
+
+    novedades.listo.connect(mostrar_novedades)
+    tray_menu.addAction("Buscar versiones nuevas del modelo").triggered.connect(
+        lambda: revisar_novedades(manual=True))
+
     tray_menu.addSeparator()
 
     quit_action = tray_menu.addAction("Salir")
@@ -895,7 +940,13 @@ if __name__ == '__main__':
             tray_menu.popup(QCursor.pos())
 
     tray_icon.activated.connect(on_tray_activated)
+    tray_icon.messageClicked.connect(abrir_novedad)
     tray_icon.show()
+
+    # Un minuto después de arrancar, para no competir con la carga del modelo.
+    # update_check decide si ya pasó una semana desde la última revisión.
+    if load_config().get("check_updates", True):
+        QTimer.singleShot(60_000, revisar_novedades)
 
     if "--batch" in sys.argv[1:]:
         show_batch()

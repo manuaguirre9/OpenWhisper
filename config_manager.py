@@ -32,6 +32,9 @@ DEFAULT_CONFIG = {
     # puede escribir en vivo: con Ctrl apretado las apps descartan las letras
     # inyectadas (ver text_injector.py).
     "hotkey_mode": "hold",
+    # Una vez por semana, consultar si salió un modelo o una versión de
+    # sherpa-onnx nueva y avisar en la bandeja. Ver update_check.py.
+    "check_updates": True,
 }
 
 def load_config():
